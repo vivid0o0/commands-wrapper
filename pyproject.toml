@@ -1,0 +1,89 @@
+[build-system]
+requires = ["setuptools==83.0.0", "wheel==0.47.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "commands-wrapper"
+version = "1.0.0"
+description = "Wrap multi-step shell sequences into a single named command."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "vivid0o0" },
+]
+keywords = ["cli", "automation", "shell", "workflow", "commands"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: System :: Shells",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "PyYAML>=6.0,<7",
+    "pexpect>=4.8,<5; platform_system != 'Windows'",
+    "windows-curses>=2.4,<3; platform_system == 'Windows'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "bandit==1.9.4",
+    "build==1.5.0",
+    "coverage==7.15.2",
+    "mypy==2.3.0",
+    "pip-audit==2.10.1",
+    "pytest==9.1.1",
+    "ruff==0.16.0",
+    "twine==7.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/vivid0o0/commands-wrapper"
+Issues = "https://github.com/vivid0o0/commands-wrapper/issues"
+Source = "https://github.com/vivid0o0/commands-wrapper"
+
+[tool.setuptools]
+packages = []
+script-files = [".commands-wrapper/commands-wrapper"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+
+[tool.coverage.run]
+branch = true
+source = [".commands-wrapper"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+show_missing = true
+precision = 2
+skip_covered = true
+fail_under = 82
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+extend-exclude = ["build", "dist"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unreachable = true
+
+[tool.bandit]
+skips = ["B404", "B603", "B606"]

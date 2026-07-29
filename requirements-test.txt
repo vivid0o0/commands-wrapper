@@ -1,0 +1,4 @@
+# Exact test/runtime constraints used by the CI matrix.
+pytest==9.1.1
+PyYAML==6.0.3
+pexpect==4.9.0; platform_system != "Windows"

@@ -1,0 +1,10 @@
+include LICENSE
+include README.md
+include CHANGELOG.md
+include SECURITY.md
+include requirements-test.txt
+include requirements-bootstrap.txt
+include requirements-ci.txt
+recursive-include .commands-wrapper commands-wrapper install.sh uninstall.sh install.ps1 uninstall.ps1
+recursive-include tests *.py
+recursive-include scripts *.py

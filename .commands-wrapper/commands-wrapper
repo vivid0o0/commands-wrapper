@@ -1,0 +1,3982 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+import yaml
+
+
+def _optional_import(module_name: str) -> Any:
+    try:
+        return importlib.import_module(module_name)
+    except ImportError:  # pragma: no cover - platform dependent
+        return None
+
+
+_curses: Any = _optional_import("curses")
+_pexpect: Any = _optional_import("pexpect")
+_termios: Any = _optional_import("termios")
+
+CURSES_AVAILABLE = _curses is not None
+PEXPECT_AVAILABLE = _pexpect is not None
+
+curses: Any = _curses
+pexpect: Any = _pexpect
+
+NON_INTERACTIVE_INTERACT_EXCEPTIONS: Tuple[type[BaseException], ...] = (OSError, ValueError)
+if PEXPECT_AVAILABLE:
+    NON_INTERACTIVE_INTERACT_EXCEPTIONS = (
+        *NON_INTERACTIVE_INTERACT_EXCEPTIONS,
+        pexpect.EOF,
+    )
+if _termios is not None:
+    NON_INTERACTIVE_INTERACT_EXCEPTIONS = (
+        *NON_INTERACTIVE_INTERACT_EXCEPTIONS,
+        _termios.error,
+    )
+
+SPAWN_PROCESS_EXCEPTIONS: Tuple[type[BaseException], ...] = (
+    OSError,
+    ValueError,
+    subprocess.SubprocessError,
+)
+if PEXPECT_AVAILABLE:
+    SPAWN_PROCESS_EXCEPTIONS = (
+        *SPAWN_PROCESS_EXCEPTIONS,
+        pexpect.ExceptionPexpect,
+    )
+
+
+def _color_output_enabled() -> bool:
+    mode = os.environ.get("COMMANDS_WRAPPER_COLOR", "auto").strip().casefold()
+    if mode in {"always", "1", "true", "yes", "on"}:
+        return True
+    if mode in {"never", "0", "false", "no", "off"}:
+        return False
+    if "NO_COLOR" in os.environ or os.environ.get("TERM", "").casefold() == "dumb":
+        return False
+    return bool(sys.stdout.isatty() or sys.stderr.isatty())
+
+
+_COLOR_OUTPUT_ENABLED = _color_output_enabled()
+ANSI_PRIMARY = "\033[38;5;67m" if _COLOR_OUTPUT_ENABLED else ""
+ANSI_MUTED = "\033[38;5;244m" if _COLOR_OUTPUT_ENABLED else ""
+ANSI_SUCCESS = "\033[38;5;108m" if _COLOR_OUTPUT_ENABLED else ""
+ANSI_ERROR = "\033[38;5;131m" if _COLOR_OUTPUT_ENABLED else ""
+ANSI_WARN = "\033[38;5;214m" if _COLOR_OUTPUT_ENABLED else ""
+ANSI_BOLD = "\033[1m" if _COLOR_OUTPUT_ENABLED else ""
+ANSI_RESET = "\033[0m" if _COLOR_OUTPUT_ENABLED else ""
+
+HEADER_TITLE = "commands-wrapper"
+PRIMARY_WRAPPER = "commands-wrapper"
+SHORT_ALIAS = "cw"
+LEGACY_ALIAS = "command-wrapper"
+HOOK_ACTIVE_ENV = "COMMANDS_WRAPPER_HOOK_ACTIVE"
+FIRST_LAUNCH_TIP_ENV = "COMMANDS_WRAPPER_DISABLE_FIRST_LAUNCH_TIP"
+HOOK_BLOCK_START = "# >>> commands-wrapper hook >>>"
+HOOK_BLOCK_END = "# <<< commands-wrapper hook <<<"
+
+_WIZARD_STARTUP_STATUS: Optional[str] = None
+
+DEFAULT_UPDATE_SOURCE = PRIMARY_WRAPPER
+UPDATE_SOURCE = os.environ.get("COMMANDS_WRAPPER_UPDATE_URL", "").strip() or DEFAULT_UPDATE_SOURCE
+# Backwards-compatible internal alias retained for existing integrations.
+UPDATE_TARBALL_URL = UPDATE_SOURCE
+DEFAULT_UPDATE_DOWNLOAD_TIMEOUT = 30
+MAX_UPDATE_ARCHIVE_BYTES = 64 * 1024 * 1024
+MAX_COMMAND_FILE_BYTES = 1024 * 1024
+MAX_YAML_NODES = 10_000
+MAX_YAML_ALIASES = 100
+ESC_KEY_DELAY_MS = 25
+
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+WRAPPER_MARKER = "COMMANDS-WRAPPER-GENERATED"
+WRAPPER_CWD_CONTEXT_TTL_SECONDS = 30.0
+
+
+def _script_bin_dir(platform_name: Optional[str] = None) -> str:
+    import site
+    import sysconfig
+
+    override = os.environ.get("COMMANDS_WRAPPER_BIN_DIR", "").strip()
+    if override and (platform_name is None or platform_name == os.name):
+        return os.path.abspath(os.path.expanduser(override))
+
+    plat = platform_name or os.name
+    if plat == os.name:
+        in_venv = getattr(sys, "base_prefix", sys.prefix) != sys.prefix
+        scripts_dir: Optional[str] = None
+        if in_venv:
+            scripts_dir = sysconfig.get_path("scripts")
+        else:
+            user_scheme = f"{plat}_user"
+            if user_scheme in sysconfig.get_scheme_names():
+                scripts_dir = sysconfig.get_path("scripts", scheme=user_scheme)
+
+        if scripts_dir:
+            return os.path.abspath(scripts_dir)
+
+    suffix = "Scripts" if plat == "nt" else "bin"
+    user_base = site.USER_BASE or os.path.expanduser("~")
+    return os.path.join(user_base, suffix)
+
+
+def _user_config_dir(platform_name: Optional[str] = None) -> str:
+    plat = platform_name or os.name
+    if plat == "nt":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "commands-wrapper")
+
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return os.path.join(os.path.expanduser(xdg), "commands-wrapper")
+    return os.path.join(os.path.expanduser("~"), ".config", "commands-wrapper")
+
+
+def _legacy_config_dir() -> str:
+    return os.path.join(os.path.expanduser("~"), ".commands-wrapper")
+
+
+def _command_file_candidates(root: str) -> List[str]:
+    return [os.path.join(root, "commands.yaml"), os.path.join(root, "commands.yml")]
+
+
+def _env_flag_enabled(name: str) -> bool:
+    value = os.environ.get(name, "").strip().casefold()
+    return value in {"1", "true", "yes", "on"}
+
+
+COMMAND_OUTPUT_REDACTION_ENV = "COMMANDS_WRAPPER_REDACT_COMMAND_OUTPUT"
+AUTO_PROMOTE_LOCAL_COMMANDS_ENV = "COMMANDS_WRAPPER_AUTO_PROMOTE_LOCAL"
+_SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b((?:api[_-]?key|token|secret|password|passwd|pwd|authorization|auth)[\w-]*)\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s]+)"
+)
+_SENSITIVE_FLAG_RE = re.compile(
+    r"(?i)(--?(?:api[_-]?key|token|secret|password|passwd|authorization|auth)\b(?:=|\s+))(\"[^\"]*\"|'[^']*'|[^\s]+)"
+)
+_AUTH_HEADER_RE = re.compile(r"(?i)(authorization\s*:\s*(?:bearer|token)\s+)([^\s\"']+)")
+_SECRET_TOKEN_RES = (
+    re.compile(r"\bghp_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),
+)
+
+
+class _StrictSafeLoader(yaml.SafeLoader):
+    def __init__(self, stream: Any):
+        super().__init__(stream)
+        self._node_count = 0
+        self._alias_count = 0
+
+    def compose_node(self, parent: Any, index: Any) -> Any:
+        if self.check_event(yaml.AliasEvent):
+            self._alias_count += 1
+            if self._alias_count > MAX_YAML_ALIASES:
+                raise yaml.YAMLError(f"YAML contains more than {MAX_YAML_ALIASES} aliases")
+        self._node_count += 1
+        if self._node_count > MAX_YAML_NODES:
+            raise yaml.YAMLError(f"YAML contains more than {MAX_YAML_NODES} nodes")
+        return super().compose_node(parent, index)
+
+
+def _construct_unique_mapping(
+    loader: _StrictSafeLoader,
+    node: yaml.MappingNode,
+    deep: bool = False,
+) -> Dict[Any, Any]:
+    mapping: Dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in mapping
+        except TypeError as exc:
+            raise yaml.YAMLError("YAML mapping keys must be hashable") from exc
+        if duplicate:
+            raise yaml.YAMLError(f"duplicate YAML mapping key: {key!r}")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_StrictSafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
+def _safe_load_yaml_text(text: str) -> Any:
+    loader = _StrictSafeLoader(text)
+    try:
+        return loader.get_single_data()
+    finally:
+        loader.dispose()
+
+
+def _read_bounded_utf8_file(
+    file_path: str,
+    *,
+    max_bytes: Optional[int] = None,
+    label: str = "command file",
+) -> str:
+    effective_max_bytes = MAX_COMMAND_FILE_BYTES if max_bytes is None else max_bytes
+    with open(file_path, "rb") as stream:
+        payload = stream.read(effective_max_bytes + 1)
+    if len(payload) > effective_max_bytes:
+        raise yaml.YAMLError(f"{label} exceeds the {effective_max_bytes}-byte safety limit")
+    try:
+        return payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise yaml.YAMLError(f"{label} is not valid UTF-8") from exc
+
+
+def _load_command_yaml_file(file_path: str) -> Any:
+    return _safe_load_yaml_text(_read_bounded_utf8_file(file_path))
+
+
+def _redact_command_text(command_text: str) -> str:
+    redacted = _SENSITIVE_ASSIGNMENT_RE.sub(r"\1=[REDACTED]", command_text)
+    redacted = _SENSITIVE_FLAG_RE.sub(r"\1[REDACTED]", redacted)
+    redacted = _AUTH_HEADER_RE.sub(r"\1[REDACTED]", redacted)
+
+    for secret_re in _SECRET_TOKEN_RES:
+        redacted = secret_re.sub("[REDACTED]", redacted)
+
+    return redacted
+
+
+def _display_command_text(command_text: str) -> str:
+    if _env_flag_enabled(COMMAND_OUTPUT_REDACTION_ENV):
+        return _redact_command_text(command_text)
+    return command_text
+
+
+def _hook_block_for_shell_init() -> str:
+    return (
+        f"{HOOK_BLOCK_START}\n"
+        f"if command -v {PRIMARY_WRAPPER} >/dev/null 2>&1; then\n"
+        f'    eval "$({PRIMARY_WRAPPER} hook)"\n'
+        "fi\n"
+        f"{HOOK_BLOCK_END}\n"
+    )
+
+
+def _shell_rc_candidates() -> List[str]:
+    if os.name == "nt":
+        return []
+
+    home = os.path.expanduser("~")
+    shell_name = os.path.basename(os.environ.get("SHELL", "").strip())
+    candidates: List[str] = []
+
+    if shell_name == "zsh":
+        candidates.append(os.path.join(home, ".zshrc"))
+    elif shell_name in ("bash", "sh"):
+        candidates.extend(
+            [
+                os.path.join(home, ".bashrc"),
+                os.path.join(home, ".profile"),
+            ]
+        )
+    else:
+        candidates.extend(
+            [
+                os.path.join(home, ".bashrc"),
+                os.path.join(home, ".profile"),
+                os.path.join(home, ".zshrc"),
+            ]
+        )
+
+    ordered: List[str] = []
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        ordered.append(candidate)
+    return ordered
+
+
+def _ensure_shell_hook_init() -> bool:
+    if os.name == "nt" or _env_flag_enabled(HOOK_ACTIVE_ENV):
+        return False
+
+    block = _hook_block_for_shell_init()
+    for rc_path in _shell_rc_candidates():
+        existing = ""
+        if os.path.exists(rc_path):
+            try:
+                with open(rc_path, encoding="utf-8") as fd:
+                    existing = fd.read()
+            except OSError:
+                continue
+
+        if HOOK_BLOCK_START in existing and HOOK_BLOCK_END in existing:
+            return False
+        if f'eval "$({PRIMARY_WRAPPER} hook)"' in existing:
+            return False
+
+        parent = os.path.dirname(rc_path)
+        if parent:
+            try:
+                os.makedirs(parent, exist_ok=True)
+            except OSError:
+                continue
+
+        if existing and not existing.endswith("\n"):
+            updated = existing + "\n\n" + block
+        elif existing:
+            updated = existing + "\n" + block
+        else:
+            updated = block
+
+        try:
+            _atomic_write_text(rc_path, updated)
+        except OSError:
+            continue
+
+        return True
+
+    return False
+
+
+def _auto_promote_local_commands_enabled() -> bool:
+    return _env_flag_enabled(AUTO_PROMOTE_LOCAL_COMMANDS_ENV)
+
+
+def _global_command_file_candidates() -> List[str]:
+    return [
+        *_command_file_candidates(_user_config_dir()),
+        *_command_file_candidates(_legacy_config_dir()),
+    ]
+
+
+def _preferred_global_command_file_for_write() -> str:
+    candidates = _global_command_file_candidates()
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return candidates[0]
+
+
+def _path_is_within(path: str, root: str) -> bool:
+    try:
+        real_path = os.path.realpath(path)
+        real_root = os.path.realpath(root)
+    except OSError:
+        return False
+
+    try:
+        return os.path.commonpath([real_path, real_root]) == real_root
+    except ValueError:
+        return False
+
+
+def _valid_commands_from_mapping(data: Dict[str, Any], source: str) -> Dict[str, Dict[str, Any]]:
+    commands: Dict[str, Dict[str, Any]] = {}
+    for raw_name, raw_cfg in data.items():
+        if _validate_command_config(raw_cfg) is not None:
+            continue
+
+        normalized_name = str(raw_name).strip()
+        if not normalized_name:
+            continue
+
+        cfg = dict(raw_cfg)
+        cfg["_source"] = source
+        commands[normalized_name] = cfg
+
+    return commands
+
+
+def _promote_local_commands_to_global(files: List[str]) -> List[str]:
+    if not _auto_promote_local_commands_enabled() or not files:
+        return []
+
+    cwd = os.getcwd()
+    cwd_real = os.path.realpath(cwd)
+    if cwd_real in (os.path.realpath(_user_config_dir()), os.path.realpath(_legacy_config_dir())):
+        return []
+
+    local_candidate_files = {
+        os.path.realpath(os.path.join(cwd, "commands.yaml")),
+        os.path.realpath(os.path.join(cwd, "commands.yml")),
+    }
+    local_candidate_dirs = [
+        os.path.realpath(os.path.join(cwd, ".commands-wrapper")),
+        os.path.realpath(os.path.join(cwd, "commands-wrapper")),
+    ]
+
+    local_files: List[str] = []
+    for file_path in files:
+        real_file = os.path.realpath(file_path)
+        if real_file in local_candidate_files:
+            local_files.append(file_path)
+            continue
+        if any(_path_is_within(real_file, local_root) for local_root in local_candidate_dirs):
+            local_files.append(file_path)
+
+    if not local_files:
+        return []
+
+    local_commands = load_cmds(local_files)
+    if not local_commands:
+        return []
+
+    global_file = _preferred_global_command_file_for_write()
+    parent = os.path.dirname(global_file)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError:
+            return []
+
+    try:
+        with _exclusive_file_lock(global_file):
+            global_data: Dict[str, Any] = {}
+            if os.path.exists(global_file):
+                loaded = _load_command_yaml_file(global_file)
+                if isinstance(loaded, dict):
+                    global_data = loaded
+
+            global_commands = _valid_commands_from_mapping(global_data, global_file)
+            lookup_index, lookup_errors = _build_command_lookup_index(global_commands)
+            if lookup_errors:
+                return []
+
+            promoted: List[str] = []
+            for name, cfg in sorted(local_commands.items()):
+                normalized_name = str(name).strip()
+                if not normalized_name:
+                    continue
+
+                if normalized_name in global_data:
+                    continue
+
+                lookup_key = _command_lookup_key(normalized_name)
+                if lookup_key in lookup_index:
+                    continue
+
+                clean_cfg = {key: value for key, value in cfg.items() if key != "_source"}
+                global_data[normalized_name] = clean_cfg
+                lookup_index[lookup_key] = normalized_name
+                promoted.append(normalized_name)
+
+            if not promoted:
+                return []
+
+            content = yaml.safe_dump(global_data, sort_keys=False)
+            _atomic_write_text(global_file, content)
+            return promoted
+    except (OSError, yaml.YAMLError):
+        return []
+
+
+def _preferred_command_file_for_write() -> str:
+    cwd = os.getcwd()
+    local_candidates = _command_file_candidates(cwd)
+    prefer_local_write = _env_flag_enabled("COMMANDS_WRAPPER_PREFER_LOCAL_WRITE")
+
+    if prefer_local_write:
+        for candidate in local_candidates:
+            if os.path.isfile(candidate):
+                return candidate
+
+    global_candidates = [
+        *_command_file_candidates(_user_config_dir()),
+        *_command_file_candidates(_legacy_config_dir()),
+    ]
+
+    for candidate in global_candidates:
+        if os.path.isfile(candidate):
+            return candidate
+
+    if prefer_local_write:
+        return local_candidates[0]
+
+    return global_candidates[0]
+
+
+def _first_launch_tip_marker_path() -> str:
+    return os.path.join(_user_config_dir(), ".first-launch-tip-shown")
+
+
+def _consume_first_launch_tip() -> bool:
+    if _env_flag_enabled(FIRST_LAUNCH_TIP_ENV):
+        return False
+
+    marker_path = _first_launch_tip_marker_path()
+    parent = os.path.dirname(marker_path)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError:
+            return False
+
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    try:
+        fd = os.open(marker_path, flags, 0o600)
+    except FileExistsError:
+        return False
+    except OSError:
+        return False
+
+    with os.fdopen(fd, "w", encoding="utf-8") as marker_file:
+        marker_file.write("shown\n")
+    return True
+
+
+def _shell_name() -> str:
+    if os.name == "nt":
+        return os.environ.get("COMSPEC", "cmd.exe")
+    return os.environ.get("SHELL", "/bin/sh")
+
+
+def _has_tui_support() -> bool:
+    return CURSES_AVAILABLE and sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _cmd_quote(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _configure_escape_key_delay() -> None:
+    set_escdelay = getattr(curses, "set_escdelay", None)
+    if not callable(set_escdelay):
+        return
+
+    try:
+        set_escdelay(ESC_KEY_DELAY_MS)
+    except curses.error:
+        pass
+
+
+def _init_colors():
+    if not curses.has_colors():
+        return
+
+    try:
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        curses.init_pair(3, 244, -1)
+        curses.init_pair(4, 108, -1)
+        curses.init_pair(5, 131, -1)
+        curses.init_pair(6, 67, -1)
+    except curses.error:
+        pass
+
+
+def SEL() -> int:
+    return curses.color_pair(1) | curses.A_BOLD
+
+
+def DIM() -> int:
+    return curses.color_pair(3)
+
+
+def OK() -> int:
+    return curses.color_pair(4) | curses.A_BOLD
+
+
+def ERR() -> int:
+    return curses.color_pair(5) | curses.A_BOLD
+
+
+def HDR() -> int:
+    return curses.color_pair(6) | curses.A_BOLD
+
+
+def _addstr(win, y, x, text, attr=0):
+    h, w = win.getmaxyx()
+    if y < 0 or y >= h or x < 0 or x >= w:
+        return
+    max_len = w - x - 1
+    if max_len <= 0:
+        return
+    try:
+        win.addstr(y, x, text[:max_len], attr)
+    except curses.error:
+        pass
+
+
+def _draw_hline(win, y, x, n, char="─"):
+    h, w = win.getmaxyx()
+    if y < 0 or y >= h or x < 0 or x >= w:
+        return
+    n = min(n, w - x)
+    if n > 0:
+        try:
+            win.addstr(y, x, char * n)
+        except curses.error:
+            pass
+
+
+def _draw_field_box_pad(pad, y, x, w, h, title: str, active: bool = False):
+    attr = HDR() if active else DIM()
+    try:
+        pad.attron(attr)
+        pad.addstr(y, x, "┌")
+        pad.addstr(y, x + w - 1, "┐")
+        pad.addstr(y + h - 1, x, "└")
+        pad.addstr(y + h - 1, x + w - 1, "┘")
+        _draw_hline(pad, y, x + 1, w - 2, "─")
+        _draw_hline(pad, y + h - 1, x + 1, w - 2, "─")
+        for i in range(1, h - 1):
+            pad.addstr(y + i, x, "│")
+            pad.addstr(y + i, x + w - 1, "│")
+        pad.attroff(attr)
+        _addstr(pad, y, x + 2, f" {title} ", HDR() if active else DIM())
+    except curses.error:
+        pass
+
+
+def _draw_header(win, title: str, compact: bool = False):
+    win.erase()
+    h, _ = win.getmaxyx()
+    y = 1
+    label = HEADER_TITLE.upper() if not compact and h > 18 else HEADER_TITLE
+    _addstr(win, y, 2, f" {label} ", HDR())
+    y += 2
+
+    _addstr(win, y, 4, title, curses.A_BOLD)
+    _draw_hline(win, y + 1, 4, len(title))
+    return y + 3
+
+
+def _read_esc_followup_key(win, wait_seconds: float = 0.04) -> int:
+    deadline = time.monotonic() + wait_seconds
+    win.nodelay(True)
+    try:
+        while time.monotonic() < deadline:
+            key = win.getch()
+            if key != -1:
+                return key
+            time.sleep(0.005)
+    finally:
+        win.nodelay(False)
+    return -1
+
+
+def _handle_escape_in_form(win, fields: List["Field"], focus: int) -> bool:
+    nk = _read_esc_followup_key(win)
+    if nk == -1:
+        return False
+
+    if nk in (10, 13):  # Alt+Enter: insert newline in multiline fields
+        f = fields[focus]
+        if f.multiline:
+            p, n = f.lines[f.cur_y][: f.cur_x], f.lines[f.cur_y][f.cur_x :]
+            f.lines[f.cur_y] = p
+            f.lines.insert(f.cur_y + 1, n)
+            f.cur_y += 1
+            f.cur_x = 0
+        return True
+
+    try:
+        curses.ungetch(nk)
+    except curses.error:
+        pass
+    return True
+
+
+def menu(win, title: str, options: List[str], status: str = "") -> Optional[int]:
+    """Arrow-key navigable menu. Returns selected index or None if cancelled."""
+    if not options:
+        return None
+
+    cur = 0
+    top = 0
+    while True:
+        y_offset = _draw_header(win, title)
+        h, w = win.getmaxyx()
+        visible_rows = max(1, h - y_offset - 3)
+
+        if cur < top:
+            top = cur
+        elif cur >= top + visible_rows:
+            top = cur - visible_rows + 1
+
+        item_width = max(24, min(w - 8, max((len(opt) for opt in options), default=0) + 6))
+
+        bottom = min(len(options), top + visible_rows)
+        for row_index, i in enumerate(range(top, bottom)):
+            row = y_offset + row_index
+            opt = options[i]
+            if i == cur:
+                _addstr(win, row, 4, f"  {opt}  ".ljust(item_width), SEL())
+            else:
+                _addstr(win, row, 6, opt, DIM())
+
+        if top > 0:
+            _addstr(win, y_offset - 1, w - 5, "^", DIM())
+        if bottom < len(options):
+            _addstr(win, y_offset + visible_rows, w - 5, "v", DIM())
+
+        hint = " ↑↓/j/k navigate   ENTER select   ESC back "
+        _addstr(win, h - 2, 2, hint, DIM())
+        if status:
+            status_attr = ERR()
+            if status.startswith("OK:"):
+                status_attr = OK()
+            elif status.startswith("WARN:"):
+                status_attr = HDR()
+            elif status.startswith("INFO:"):
+                status_attr = DIM()
+            _addstr(win, h - 3, 2, status, status_attr)
+
+        win.refresh()
+        key = win.getch()
+
+        if key == 27:  # ESC or Alt+key
+            nk = _read_esc_followup_key(win)
+            if nk == -1:
+                return None
+            key = nk
+
+        if key in (curses.KEY_UP, ord("k"), ord("K")):
+            cur = (cur - 1) % len(options)
+        elif key in (curses.KEY_DOWN, ord("j"), ord("J")):
+            cur = (cur + 1) % len(options)
+        elif key in (curses.KEY_ENTER, ord("\n"), ord("\r")):
+            return cur
+        elif key in (ord("q"), ord("Q")):
+            return None
+
+
+class Field:
+    def __init__(
+        self, key: str, label: str, value: str = "", multiline: bool = False, box_h: int = 3
+    ):
+        self.key = key
+        self.label = label
+        self.lines = [list(line) for line in str(value).split("\n")] if value else [[]]
+        self.cur_y = 0
+        self.cur_x = 0
+        self.view_y = 0
+        self.view_x = 0
+        self.multiline = multiline
+        self.box_h = box_h
+        self.top_y = 0
+
+    def get_value(self) -> str:
+        return "\n".join("".join(line) for line in self.lines).strip()
+
+
+def form_input(win, title: str, fields: List[Field]) -> Optional[Dict[str, str]]:
+    """Adaptive form engine. Switches between unified and focused modes based on available height."""
+    focus = 0
+    form_scroll = 0
+
+    prev_cursor: Optional[int] = None
+    try:
+        prev_cursor = curses.curs_set(0)
+    except curses.error:
+        prev_cursor = None
+    try:
+        while True:
+            h, w = win.getmaxyx()
+            sw = w - 8
+
+            compact = h < 26
+            y_hdr = _draw_header(win, title, compact=compact)
+            avail_h = h - y_hdr - 3
+
+            total_field_h = sum(f.box_h + 1 for f in fields)
+            focus_mode = total_field_h + 2 > avail_h
+
+            ph = max(total_field_h + 10, h * 2)
+            pad = curses.newpad(ph, w)
+
+            py = 0
+            for i, f in enumerate(fields):
+                f.top_y = py if not focus_mode else 0
+                is_active = i == focus
+
+                if focus_mode and not is_active:
+                    continue
+
+                box_h = f.box_h
+                if focus_mode:
+                    box_h = max(f.box_h, min(avail_h, 10))
+
+                _draw_field_box_pad(pad, f.top_y, 4, sw, box_h, f.label, active=is_active)
+
+                fw = sw - 4
+                fh = box_h - 2
+
+                if is_active:
+                    if f.cur_y < f.view_y:
+                        f.view_y = f.cur_y
+                    elif f.cur_y >= f.view_y + fh:
+                        f.view_y = f.cur_y - fh + 1
+                    if f.cur_x < f.view_x:
+                        f.view_x = f.cur_x
+                    elif f.cur_x >= f.view_x + fw:
+                        f.view_x = f.cur_x - fw + 1
+
+                for r in range(fh):
+                    ridx = f.view_y + r
+                    if ridx < len(f.lines):
+                        line_data = "".join(f.lines[ridx])[f.view_x : f.view_x + fw]
+                        try:
+                            pad.addstr(f.top_y + 1 + r, 6, line_data)
+                        except curses.error:
+                            pass
+                        if f.view_x > 0:
+                            pad.addch(f.top_y + 1 + r, 5, "<", DIM())
+                        if len(f.lines[ridx]) > f.view_x + fw:
+                            pad.addch(f.top_y + 1 + r, 6 + fw, ">", DIM())
+
+                if is_active:
+                    cursor_row = f.cur_y - f.view_y
+                    cursor_col = f.cur_x - f.view_x
+                    if 0 <= cursor_row < fh and 0 <= cursor_col < fw:
+                        cursor_char = " "
+                        if f.cur_y < len(f.lines):
+                            line_chars = f.lines[f.cur_y]
+                            if f.cur_x < len(line_chars):
+                                cursor_char = line_chars[f.cur_x]
+                        try:
+                            pad.addch(
+                                f.top_y + 1 + cursor_row,
+                                6 + cursor_col,
+                                cursor_char,
+                                curses.A_REVERSE | curses.A_BOLD,
+                            )
+                        except curses.error:
+                            pass
+
+                if not focus_mode:
+                    py += box_h + 1
+
+            if not focus_mode:
+                active_f = fields[focus]
+                if active_f.top_y < form_scroll:
+                    form_scroll = active_f.top_y
+                elif active_f.top_y + active_f.box_h > form_scroll + avail_h:
+                    form_scroll = active_f.top_y + active_f.box_h - avail_h
+            else:
+                form_scroll = 0
+
+            win.refresh()
+            r_y1, r_x1 = y_hdr, 0
+            r_y2, r_x2 = max(r_y1, h - 3), w - 1
+            try:
+                pad.refresh(form_scroll, 0, r_y1, r_x1, r_y2, r_x2)
+            except curses.error:
+                pass
+
+            h_hint = " TAB nav  ENTER next  Ctrl+S save  ESC cancel "
+            if focus_mode:
+                h_hint = f" [ FIELD {focus + 1}/{len(fields)} ]  " + h_hint
+            _addstr(win, h - 1, 2, h_hint.strip().center(w - 4), DIM())
+            win.refresh()
+
+            key = win.getch()
+
+            if key == 19:  # Ctrl+S
+                return {f.key: f.get_value() for f in fields}
+            elif key == 27:  # ESC or Alt+key
+                if not _handle_escape_in_form(win, fields, focus):
+                    return None
+                continue
+            elif key == 9:  # Tab
+                focus = (focus + 1) % len(fields)
+            elif key == curses.KEY_BTAB:
+                focus = (focus - 1) % len(fields)
+            elif key == curses.KEY_UP:
+                f = fields[focus]
+                if f.cur_y > 0:
+                    f.cur_y -= 1
+                    f.cur_x = min(f.cur_x, len(f.lines[f.cur_y]))
+                else:
+                    focus = (focus - 1) % len(fields)
+                    fields[focus].cur_y = len(fields[focus].lines) - 1
+            elif key == curses.KEY_DOWN:
+                f = fields[focus]
+                if f.cur_y < len(f.lines) - 1:
+                    f.cur_y += 1
+                    f.cur_x = min(f.cur_x, len(f.lines[f.cur_y]))
+                else:
+                    focus = (focus + 1) % len(fields)
+                    fields[focus].cur_y = 0
+            elif key == curses.KEY_LEFT:
+                f = fields[focus]
+                if f.cur_x > 0:
+                    f.cur_x -= 1
+                elif f.cur_y > 0:
+                    f.cur_y -= 1
+                    f.cur_x = len(f.lines[f.cur_y])
+            elif key == curses.KEY_RIGHT:
+                f = fields[focus]
+                if f.cur_x < len(f.lines[f.cur_y]):
+                    f.cur_x += 1
+                elif f.cur_y < len(f.lines) - 1:
+                    f.cur_y += 1
+                    f.cur_x = 0
+            elif key in (10, 13, curses.KEY_ENTER):
+                f = fields[focus]
+                if focus == len(fields) - 1:
+                    return {field.key: field.get_value() for field in fields}
+                focus += 1
+            elif key in (8, 127, curses.KEY_BACKSPACE):
+                f = fields[focus]
+                if f.cur_x > 0:
+                    f.lines[f.cur_y].pop(f.cur_x - 1)
+                    f.cur_x -= 1
+                elif f.cur_y > 0:
+                    ol = len(f.lines[f.cur_y - 1])
+                    f.lines[f.cur_y - 1].extend(f.lines[f.cur_y])
+                    f.lines.pop(f.cur_y)
+                    f.cur_y -= 1
+                    f.cur_x = ol
+            elif key == curses.KEY_DC:
+                f = fields[focus]
+                if f.cur_x < len(f.lines[f.cur_y]):
+                    f.lines[f.cur_y].pop(f.cur_x)
+                elif f.cur_y < len(f.lines) - 1:
+                    f.lines[f.cur_y].extend(f.lines[f.cur_y + 1])
+                    f.lines.pop(f.cur_y + 1)
+            elif 32 <= key <= 126:
+                f = fields[focus]
+                f.lines[f.cur_y].insert(f.cur_x, chr(key))
+                f.cur_x += 1
+    finally:
+        if prev_cursor is not None:
+            try:
+                curses.curs_set(prev_cursor)
+            except curses.error:
+                pass
+
+
+def _step_label(s: Dict) -> str:
+    if "command" in s:
+        return f"  [COMMAND]  {s['command']}"
+    if "send" in s:
+        return f"  [SEND]     {s['send']}"
+    if "press_key" in s:
+        return f"  [KEY]      {s['press_key']}"
+    if "wait" in s:
+        return f"  [WAIT]     {s['wait']}s"
+    return "  [UNKNOWN]  unsupported step"
+
+
+def _edit_existing_step(win, step: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if "command" in step:
+        res = form_input(
+            win,
+            "Edit step",
+            [Field("val", "Command:", value=str(step["command"]), multiline=True, box_h=7)],
+        )
+        if not res or not res["val"]:
+            return None
+        return {"command": res["val"]}
+
+    if "send" in step:
+        res = form_input(
+            win,
+            "Edit step",
+            [Field("val", "Text to send:", value=str(step["send"]), multiline=True, box_h=5)],
+        )
+        if not res or not res["val"]:
+            return None
+        return {"send": res["val"]}
+
+    if "press_key" in step:
+        res = form_input(
+            win,
+            "Edit step",
+            [Field("val", "Key (e.g. enter, tab, esc):", value=str(step["press_key"]))],
+        )
+        if not res or not res["val"]:
+            return None
+        return {"press_key": res["val"]}
+
+    if "wait" in step:
+        res = form_input(
+            win, "Edit step", [Field("val", "Duration (seconds):", value=str(step["wait"]))]
+        )
+        if not res or not res["val"]:
+            return None
+
+        wait_value = res["val"].strip()
+        try:
+            wait_duration = float(wait_value)
+        except ValueError:
+            return {"_error": "ERR: Wait must be a number"}
+
+        if wait_duration < 0:
+            return {"_error": "ERR: Wait must be non-negative"}
+
+        return {"wait": wait_value}
+
+    return None
+
+
+def steps_editor(win, initial_steps: Optional[List[Dict]] = None) -> Optional[List[Dict]]:
+    """Interactive step timeline editor. Returns updated steps or None if cancelled."""
+    steps = list(initial_steps or [])
+    status = ""
+
+    while True:
+        labels = [_step_label(s) for s in steps]
+        labels.append("  + Add step")
+        labels.append("  Save and return")
+
+        choice = menu(win, "Step Timeline", labels, status)
+        status = ""
+
+        if choice is None:
+            return None
+
+        if choice == len(steps) + 1:
+            return steps
+
+        if choice == len(steps):
+            stype = menu(
+                win,
+                "Step type",
+                [
+                    "command   : run a shell command",
+                    "send      : type text into running process",
+                    "press_key : send a special key",
+                    "wait      : pause execution",
+                ],
+            )
+            if stype is None:
+                continue
+
+            title = "Add step"
+            if stype == 0:
+                res = form_input(win, title, [Field("val", "Command:", multiline=True, box_h=7)])
+                if res and res["val"]:
+                    steps.append({"command": res["val"]})
+                    status = "OK: Step added"
+            elif stype == 1:
+                res = form_input(
+                    win, title, [Field("val", "Text to send:", multiline=True, box_h=5)]
+                )
+                if res and res["val"]:
+                    steps.append({"send": res["val"]})
+                    status = "OK: Step added"
+            elif stype == 2:
+                res = form_input(win, title, [Field("val", "Key (e.g. enter, tab, esc):")])
+                if res and res["val"]:
+                    steps.append({"press_key": res["val"]})
+                    status = "OK: Step added"
+            elif stype == 3:
+                res = form_input(win, title, [Field("val", "Duration (seconds):")])
+                if res and res["val"]:
+                    wait_value = res["val"].strip()
+                    try:
+                        wait_duration = float(wait_value)
+                    except ValueError:
+                        status = "ERR: Wait must be a number"
+                        continue
+
+                    if wait_duration < 0:
+                        status = "ERR: Wait must be non-negative"
+                        continue
+
+                    steps.append({"wait": wait_value})
+                    status = "OK: Step added"
+
+        else:
+            action = menu(
+                win,
+                f"Step {choice + 1}: {_step_label(steps[choice]).strip()}",
+                [
+                    "Edit",
+                    "Move up",
+                    "Move down",
+                    "Delete",
+                    "Cancel",
+                ],
+            )
+            if action == 0:
+                edited = _edit_existing_step(win, steps[choice])
+                if edited is None:
+                    continue
+                if "_error" in edited:
+                    status = str(edited["_error"])
+                    continue
+                steps[choice] = edited
+                status = "OK: Step updated"
+            elif action == 1 and choice > 0:
+                steps[choice], steps[choice - 1] = steps[choice - 1], steps[choice]
+                status = "OK: Moved up"
+            elif action == 2 and choice < len(steps) - 1:
+                steps[choice], steps[choice + 1] = steps[choice + 1], steps[choice]
+                status = "OK: Moved down"
+            elif action == 3:
+                steps.pop(choice)
+                status = "OK: Step removed"
+
+
+def _scan_yaml_files(directory: str) -> List[str]:
+    if not os.path.isdir(directory):
+        return []
+
+    results: List[str] = []
+    try:
+        for entry in sorted(os.listdir(directory), key=lambda entry: (entry.casefold(), entry)):
+            if entry.startswith("."):
+                continue
+            if not entry.endswith((".yaml", ".yml")):
+                continue
+            path = os.path.join(directory, entry)
+            if os.path.isfile(path):
+                results.append(path)
+    except PermissionError:
+        return []
+
+    return results
+
+
+def find_yamls() -> List[str]:
+    cwd = os.getcwd()
+    roots = list(dict.fromkeys([_legacy_config_dir(), _user_config_dir(), cwd]))
+
+    found: List[str] = []
+    for root in roots:
+        candidates = list(_command_file_candidates(root))
+
+        if root == cwd:
+            for d in (".commands-wrapper", "commands-wrapper"):
+                candidates.extend(_scan_yaml_files(os.path.join(root, d)))
+        else:
+            candidates.extend(_scan_yaml_files(root))
+
+        found.extend(path for path in candidates if os.path.isfile(path))
+
+    ordered: List[str] = []
+    seen = set()
+    for path in found:
+        if path in seen:
+            continue
+        seen.add(path)
+        ordered.append(path)
+
+    return ordered
+
+
+STEP_ACTIONS = ("command", "send", "press_key", "wait")
+
+
+def _is_steps_key(key: Any) -> bool:
+    return re.fullmatch(r"steps(?:\s+.*)?", str(key).strip()) is not None
+
+
+def _get_steps_key(cfg: Dict[str, Any]) -> Optional[str]:
+    return next((str(k) for k in cfg if _is_steps_key(k)), None)
+
+
+def _parse_timeout(steps_key: str) -> Optional[int]:
+    parts = str(steps_key).strip().split(maxsplit=1)
+    if len(parts) == 1:
+        return None
+    try:
+        timeout = int(parts[1])
+    except ValueError as exc:
+        raise ValueError(f"invalid timeout in '{steps_key}'") from exc
+    if timeout <= 0:
+        raise ValueError(f"timeout must be positive in '{steps_key}'")
+    return timeout
+
+
+def _validate_steps(steps: Any) -> Optional[str]:
+    if not isinstance(steps, list):
+        return "steps value must be a list"
+    if not steps:
+        return "steps list must not be empty"
+
+    for index, step in enumerate(steps, start=1):
+        if not isinstance(step, dict):
+            return f"step {index} must be a mapping"
+
+        action_keys = [action for action in STEP_ACTIONS if action in step]
+        if len(action_keys) != 1 or len(step) != 1:
+            supported = ", ".join(STEP_ACTIONS)
+            return f"step {index} must contain exactly one supported action ({supported})"
+
+        action = action_keys[0]
+        value = step[action]
+        if action == "command":
+            if not isinstance(value, str) or not value.strip():
+                return f"step {index} command must be a non-empty string"
+        elif action in {"send", "press_key"}:
+            if not isinstance(value, str):
+                return f"step {index} {action} value must be a string"
+        else:
+            try:
+                duration = float(value)
+            except (TypeError, ValueError):
+                return f"step {index} wait value must be numeric"
+            if (
+                duration < 0
+                or duration == float("inf")
+                or duration == float("-inf")
+                or duration != duration
+            ):
+                return f"step {index} wait value must be a finite non-negative number"
+
+    return None
+
+
+def _validate_command_config(cfg: Any) -> Optional[str]:
+    if not isinstance(cfg, dict):
+        return "command definition must be a mapping"
+
+    steps_keys = [str(key) for key in cfg if _is_steps_key(key)]
+    if not steps_keys:
+        return "no steps key found"
+    if len(steps_keys) > 1:
+        return "command definition must contain exactly one steps key"
+
+    steps_key = steps_keys[0]
+    try:
+        _parse_timeout(steps_key)
+    except ValueError as exc:
+        return str(exc)
+
+    return _validate_steps(cfg.get(steps_key))
+
+
+def _error(message: str) -> None:
+    sys.stderr.write(f"{ANSI_ERROR}Error:{ANSI_RESET} {message}\n")
+
+
+def _ok(message: str) -> None:
+    print(f"{ANSI_SUCCESS}{message}{ANSI_RESET}")
+
+
+def _warn(message: str) -> None:
+    sys.stderr.write(f"{ANSI_WARN}Warning:{ANSI_RESET} {message}\n")
+
+
+def _report_sync_messages(messages: List[str], emit: bool = True) -> bool:
+    has_errors = False
+    for message in messages:
+        if message.startswith("WARN: "):
+            if emit:
+                _warn(message[6:])
+        else:
+            if emit:
+                _error(message)
+            has_errors = True
+    return has_errors
+
+
+def _first_non_warning_message(messages: List[str]) -> Optional[str]:
+    for message in messages:
+        if not message.startswith("WARN: "):
+            return message
+    if messages:
+        return messages[0]
+    return None
+
+
+def load_cmds(files: List[str], warnings: Optional[List[str]] = None) -> Dict[str, Dict[str, Any]]:
+    cmds = {}
+    for f in files:
+        try:
+            data = _load_command_yaml_file(f)
+        except OSError as exc:
+            if warnings is not None:
+                warnings.append(f"failed to read command file '{f}': {exc}")
+            continue
+        except yaml.YAMLError as exc:
+            if warnings is not None:
+                warnings.append(f"failed to parse command file '{f}': {exc}")
+            continue
+
+        if not isinstance(data, dict):
+            continue
+
+        for k, v in data.items():
+            validation_error = _validate_command_config(v)
+            if validation_error:
+                if warnings is not None:
+                    warnings.append(f"invalid command '{k}' in '{f}': {validation_error}")
+                continue
+            cfg = dict(v)
+            cfg["_source"] = f
+            cmds[str(k)] = cfg
+    return cmds
+
+
+def _load_commands_for_sync() -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+    warnings: List[str] = []
+    db = load_cmds(find_yamls(), warnings=warnings)
+    return db, warnings
+
+
+def _sync_messages_with_load_warnings(
+    db: Dict[str, Any],
+    load_warnings: List[str],
+    *,
+    uninstall: bool = False,
+    report_conflicts: bool = True,
+    prune_stale: bool = True,
+) -> List[str]:
+    messages = [f"WARN: {warning}" for warning in load_warnings]
+    should_prune_stale = prune_stale
+    sync_kwargs: Dict[str, Any] = {
+        "uninstall": uninstall,
+        "report_conflicts": report_conflicts,
+    }
+    if load_warnings:
+        should_prune_stale = False
+        messages.append("WARN: skipped stale wrapper cleanup due to command-file load warnings")
+
+    sync_kwargs["prune_stale"] = should_prune_stale
+
+    messages.extend(sync_binaries(db, **sync_kwargs))
+    return messages
+
+
+def _is_own_wrapper_path(path: str, target_dir: str) -> bool:
+    try:
+        real_path = os.path.realpath(path)
+    except OSError:
+        return False
+
+    if os.path.dirname(real_path) != os.path.realpath(target_dir):
+        return False
+
+    if not os.path.isfile(real_path):
+        return False
+
+    try:
+        with open(real_path, "r", encoding="utf-8", errors="ignore") as fd:
+            header = fd.read(160)
+    except OSError:
+        return False
+
+    return WRAPPER_MARKER in header
+
+
+def _wrapper_name_from_command_name(command_name: str) -> Optional[str]:
+    normalized = str(command_name).strip()
+    if not normalized:
+        return None
+
+    wrapper_name = "-".join(normalized.split()).casefold()
+    if not wrapper_name:
+        return None
+
+    if not all(c.isalnum() or c in "-_" for c in wrapper_name):
+        return None
+
+    if wrapper_name in (
+        SHORT_ALIAS.casefold(),
+        LEGACY_ALIAS.casefold(),
+        PRIMARY_WRAPPER.casefold(),
+    ):
+        return None
+
+    return wrapper_name
+
+
+def _wrapper_alias_from_command_name(command_name: str) -> Optional[str]:
+    normalized = str(command_name).strip()
+    if not normalized:
+        return None
+
+    wrapper_alias = "-".join(normalized.split())
+    if not wrapper_alias:
+        return None
+
+    canonical = _wrapper_name_from_command_name(command_name)
+    if not canonical:
+        return None
+
+    if wrapper_alias == canonical:
+        return None
+
+    if not all(c.isalnum() or c in "-_" for c in wrapper_alias):
+        return None
+
+    if wrapper_alias.casefold() in (
+        SHORT_ALIAS.casefold(),
+        LEGACY_ALIAS.casefold(),
+        PRIMARY_WRAPPER.casefold(),
+    ):
+        return None
+
+    return wrapper_alias
+
+
+def _wrapper_upper_alias(wrapper_name: str) -> Optional[str]:
+    if not wrapper_name:
+        return None
+
+    uppercase_alias = wrapper_name.upper()
+    if uppercase_alias == wrapper_name:
+        return None
+
+    return uppercase_alias
+
+
+def _namespace_prefix_from_command_name(command_name: str) -> Optional[str]:
+    normalized = str(command_name).strip()
+    if not normalized:
+        return None
+
+    parts = normalized.split()
+    if len(parts) < 2:
+        return None
+
+    return parts[0]
+
+
+def _command_lookup_key(name: Any) -> str:
+    return str(name).strip().casefold()
+
+
+def _build_command_lookup_index(db: Dict[str, Any]) -> Tuple[Dict[str, str], List[str]]:
+    index: Dict[str, str] = {}
+    errors: List[str] = []
+
+    for raw_name in db.keys():
+        raw_command_name = str(raw_name)
+        command_name = raw_command_name.strip()
+        if not command_name:
+            continue
+
+        lookup_key = _command_lookup_key(command_name)
+        previous = index.get(lookup_key)
+        if previous and previous != raw_command_name:
+            errors.append(
+                f"case-insensitive command name collision: {previous!r} vs {raw_command_name!r}"
+            )
+            continue
+
+        index[lookup_key] = raw_command_name
+
+    return index, errors
+
+
+def _resolve_command_name(
+    requested: str,
+    db: Dict[str, Any],
+    lookup_index: Dict[str, str],
+) -> Optional[str]:
+    if requested in db:
+        return requested
+
+    return lookup_index.get(_command_lookup_key(requested))
+
+
+def _find_case_insensitive_conflict(
+    name: str,
+    candidates: List[str],
+    *,
+    ignore_name: Optional[str] = None,
+) -> Optional[str]:
+    target_key = _command_lookup_key(name)
+    for candidate in candidates:
+        if ignore_name is not None and candidate == ignore_name:
+            continue
+        if _command_lookup_key(candidate) == target_key:
+            return candidate
+    return None
+
+
+def _format_conflict_warning(wrapper_name: str, command_name: str) -> str:
+    return (
+        f"WARN: skipped naked wrapper '{wrapper_name}' for command '{command_name}' "
+        "because that name is already used by another executable on PATH. "
+        f"Use '{SHORT_ALIAS} {command_name}' or '{PRIMARY_WRAPPER} {command_name}' instead."
+    )
+
+
+def _build_wrapper_map(db: Dict[str, Any]) -> Tuple[Dict[str, str], List[str]]:
+    wrappers: Dict[str, str] = {}
+    errors: List[str] = []
+
+    for key in db.keys():
+        command_name = str(key).strip()
+        wrapper_name = _wrapper_name_from_command_name(command_name)
+        if not wrapper_name:
+            continue
+
+        wrapper_targets: List[Tuple[str, str]] = [(wrapper_name, command_name)]
+
+        wrapper_alias = _wrapper_alias_from_command_name(command_name)
+        if wrapper_alias:
+            wrapper_targets.append((wrapper_alias, command_name))
+
+        namespace_prefix = _namespace_prefix_from_command_name(command_name)
+        if namespace_prefix:
+            namespace_wrapper = _wrapper_name_from_command_name(namespace_prefix)
+            if namespace_wrapper:
+                wrapper_targets.append((namespace_wrapper, namespace_prefix))
+
+            namespace_alias = _wrapper_alias_from_command_name(namespace_prefix)
+            if namespace_alias:
+                wrapper_targets.append((namespace_alias, namespace_prefix))
+
+        seen_targets: Dict[str, str] = {}
+        for candidate, target_command in wrapper_targets:
+            if candidate in seen_targets:
+                continue
+            seen_targets[candidate] = target_command
+
+            uppercase_alias = _wrapper_upper_alias(candidate)
+            if uppercase_alias and uppercase_alias not in seen_targets:
+                seen_targets[uppercase_alias] = target_command
+
+        for candidate, target_command in seen_targets.items():
+            previous = wrappers.get(candidate)
+            if previous and previous != target_command:
+                errors.append(
+                    f"wrapper name collision for '{candidate}': '{previous}' vs '{target_command}'"
+                )
+                continue
+
+            wrappers[candidate] = target_command
+
+    return wrappers, errors
+
+
+def _build_wrapper_map_with_conflicts(
+    db: Dict[str, Any],
+    target_dir: str,
+    report_conflicts: bool = True,
+) -> Tuple[Dict[str, str], List[str], Dict[str, str]]:
+    wrappers, errors = _build_wrapper_map(db)
+    filtered: Dict[str, str] = {}
+    blocked: Dict[str, str] = {}
+
+    search_path = os.environ.get("PATH")
+
+    for wrapper_name, command_name in wrappers.items():
+        resolved = shutil.which(wrapper_name, path=search_path)
+
+        if resolved and not _is_own_wrapper_path(resolved, target_dir):
+            blocked[wrapper_name] = command_name
+            if report_conflicts:
+                errors.append(_format_conflict_warning(wrapper_name, command_name))
+            continue
+
+        filtered[wrapper_name] = command_name
+
+    return filtered, errors, blocked
+
+
+def _atomic_write_text(file_path: str, content: str, *, mode: Optional[int] = None) -> None:
+    target_path = os.path.realpath(file_path) if os.path.islink(file_path) else file_path
+    parent = os.path.dirname(target_path) or "."
+    fd: Optional[int] = None
+    temp_path: Optional[str] = None
+
+    if mode is None:
+        try:
+            mode = os.stat(target_path).st_mode & 0o777
+        except FileNotFoundError:
+            mode = 0o600
+
+    try:
+        fd, temp_path = tempfile.mkstemp(
+            prefix=".commands-wrapper-",
+            suffix=".tmp",
+            dir=parent,
+        )
+
+        if os.name != "nt":
+            os.fchmod(fd, mode)
+
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as temp_file:
+            fd = None
+            temp_file.write(content)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+
+        os.replace(temp_path, target_path)
+
+        if os.name != "nt":
+            dir_fd: Optional[int] = None
+            try:
+                dir_fd = os.open(parent, os.O_RDONLY)
+                os.fsync(dir_fd)
+            except OSError:
+                pass
+            finally:
+                if dir_fd is not None:
+                    os.close(dir_fd)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if temp_path is not None and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+def _wrapper_cwd_context_path() -> str:
+    return os.path.join(_user_config_dir(), ".runtime", "cwd-context.yaml")
+
+
+@contextmanager
+def _exclusive_file_lock(
+    target_path: str,
+    *,
+    timeout_seconds: float = 2.0,
+    stale_seconds: float = 30.0,
+) -> Iterator[None]:
+    lock_path = f"{target_path}.lock"
+    parent = os.path.dirname(lock_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    deadline = time.monotonic() + timeout_seconds
+    lock_fd: Optional[int] = None
+    while lock_fd is None:
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            try:
+                age = time.time() - os.path.getmtime(lock_path)
+            except OSError:
+                age = 0.0
+            if age >= stale_seconds:
+                try:
+                    os.remove(lock_path)
+                except OSError:
+                    pass
+                continue
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for state lock '{lock_path}'") from None
+            time.sleep(0.01)
+
+    try:
+        os.write(lock_fd, f"{os.getpid()}\n".encode("ascii", errors="ignore"))
+        yield
+    finally:
+        os.close(lock_fd)
+        try:
+            os.remove(lock_path)
+        except OSError:
+            pass
+
+
+def _load_wrapper_cwd_context(path: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    context_path = path or _wrapper_cwd_context_path()
+    try:
+        loaded = _load_command_yaml_file(context_path)
+    except (OSError, yaml.YAMLError):
+        return {}
+
+    if not isinstance(loaded, dict):
+        return {}
+
+    context: Dict[str, Dict[str, Any]] = {}
+    for raw_pid, raw_entry in loaded.items():
+        pid = str(raw_pid).strip()
+        if not pid or not isinstance(raw_entry, dict):
+            continue
+
+        cwd_value = raw_entry.get("cwd")
+        expires_at_value = raw_entry.get("expires_at")
+        if not isinstance(cwd_value, str) or not cwd_value:
+            continue
+        if not isinstance(expires_at_value, (int, float, str)):
+            continue
+
+        try:
+            expires_at = float(expires_at_value)
+        except (TypeError, ValueError):
+            continue
+
+        context[pid] = {
+            "cwd": cwd_value,
+            "expires_at": expires_at,
+        }
+
+    return context
+
+
+def _save_wrapper_cwd_context(
+    context: Dict[str, Dict[str, Any]], path: Optional[str] = None
+) -> None:
+    context_path = path or _wrapper_cwd_context_path()
+
+    if not context:
+        try:
+            os.remove(context_path)
+        except OSError:
+            pass
+        return
+
+    parent = os.path.dirname(context_path)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError:
+            return
+
+    try:
+        content = yaml.safe_dump(context, sort_keys=True)
+    except yaml.YAMLError:
+        return
+
+    try:
+        _atomic_write_text(context_path, content, mode=0o600)
+    except OSError:
+        pass
+
+
+def _prune_wrapper_cwd_context(
+    context: Dict[str, Dict[str, Any]], now: Optional[float] = None
+) -> None:
+    current_time = time.time() if now is None else now
+    for pid in list(context.keys()):
+        entry = context.get(pid)
+        if not isinstance(entry, dict):
+            context.pop(pid, None)
+            continue
+
+        cwd_value = entry.get("cwd")
+        expires_at_value = entry.get("expires_at")
+        if not isinstance(cwd_value, str) or not cwd_value:
+            context.pop(pid, None)
+            continue
+        if not isinstance(expires_at_value, (int, float, str)):
+            context.pop(pid, None)
+            continue
+
+        try:
+            expires_at = float(expires_at_value)
+        except (TypeError, ValueError):
+            context.pop(pid, None)
+            continue
+
+        if expires_at <= current_time:
+            context.pop(pid, None)
+
+
+def _context_cwd(context: Dict[str, Dict[str, Any]], parent_pid: int) -> Optional[str]:
+    entry = context.get(str(parent_pid))
+    if not isinstance(entry, dict):
+        return None
+    cwd_value = entry.get("cwd")
+    if not isinstance(cwd_value, str) or not cwd_value:
+        return None
+    return cwd_value
+
+
+def _remember_wrapper_cwd_context(parent_pid: int, cwd: str) -> None:
+    if parent_pid <= 0 or not cwd:
+        return
+
+    context_path = _wrapper_cwd_context_path()
+    try:
+        with _exclusive_file_lock(context_path):
+            context = _load_wrapper_cwd_context(context_path)
+            _prune_wrapper_cwd_context(context)
+            context[str(parent_pid)] = {
+                "cwd": cwd,
+                "expires_at": time.time() + WRAPPER_CWD_CONTEXT_TTL_SECONDS,
+            }
+            _save_wrapper_cwd_context(context, context_path)
+    except OSError:
+        return
+
+
+def _consume_wrapper_cwd_context(parent_pid: int) -> Optional[str]:
+    if parent_pid <= 0:
+        return None
+
+    context_path = _wrapper_cwd_context_path()
+    try:
+        with _exclusive_file_lock(context_path):
+            context = _load_wrapper_cwd_context(context_path)
+            _prune_wrapper_cwd_context(context)
+            pending_cwd = _context_cwd(context, parent_pid)
+            context.pop(str(parent_pid), None)
+            _save_wrapper_cwd_context(context, context_path)
+            return pending_cwd
+    except OSError:
+        return None
+
+
+def _peek_wrapper_cwd_context(parent_pid: int) -> Optional[str]:
+    if parent_pid <= 0:
+        return None
+
+    context_path = _wrapper_cwd_context_path()
+    try:
+        with _exclusive_file_lock(context_path):
+            context = _load_wrapper_cwd_context(context_path)
+            _prune_wrapper_cwd_context(context)
+            _save_wrapper_cwd_context(context, context_path)
+            return _context_cwd(context, parent_pid)
+    except OSError:
+        return None
+
+
+def _clear_wrapper_cwd_context(parent_pid: int) -> None:
+    if parent_pid <= 0:
+        return
+
+    context_path = _wrapper_cwd_context_path()
+    try:
+        with _exclusive_file_lock(context_path):
+            context = _load_wrapper_cwd_context(context_path)
+            _prune_wrapper_cwd_context(context)
+            context.pop(str(parent_pid), None)
+            _save_wrapper_cwd_context(context, context_path)
+    except OSError:
+        return
+
+
+def _apply_wrapper_cwd_context(parent_pid: Optional[int]) -> None:
+    if not parent_pid:
+        return
+
+    pending_cwd = _peek_wrapper_cwd_context(parent_pid)
+    if not pending_cwd:
+        return
+
+    try:
+        previous = os.getcwd()
+    except OSError:
+        previous = ""
+
+    try:
+        os.chdir(pending_cwd)
+    except OSError:
+        return
+
+    _clear_wrapper_cwd_context(parent_pid)
+
+    if previous:
+        os.environ["OLDPWD"] = previous
+    os.environ["PWD"] = os.getcwd()
+
+
+def sync_binaries(
+    db: Dict[str, Any],
+    uninstall: bool = False,
+    bin_dir: Optional[str] = None,
+    platform_name: Optional[str] = None,
+    report_conflicts: bool = True,
+    prune_stale: bool = True,
+) -> List[str]:
+    import stat
+
+    errors: List[str] = []
+    plat = platform_name or os.name
+    target_dir = bin_dir or _script_bin_dir(plat)
+    if uninstall:
+        if not os.path.exists(target_dir):
+            return errors
+        if not os.path.isdir(target_dir):
+            return [f"wrapper directory path is not a directory: '{target_dir}'"]
+    else:
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+        except OSError as exc:
+            reason = exc.strerror or str(exc)
+            return [f"failed to create wrapper directory '{target_dir}': {reason}"]
+
+    custom_wrappers: Dict[str, str] = {}
+    if not uninstall:
+        custom_wrappers, wrapper_errors, _ = _build_wrapper_map_with_conflicts(
+            db,
+            target_dir,
+            report_conflicts=report_conflicts,
+        )
+        errors.extend(wrapper_errors)
+
+    wrapper_targets: Dict[str, Optional[str]] = {}
+    if not uninstall:
+        wrapper_targets = {
+            SHORT_ALIAS: None,
+            LEGACY_ALIAS: None,
+        }
+        wrapper_targets.update(custom_wrappers)
+
+        expanded_wrapper_targets: Dict[str, Optional[str]] = {}
+        for wrapper_name, command_name in wrapper_targets.items():
+            if wrapper_name not in expanded_wrapper_targets:
+                expanded_wrapper_targets[wrapper_name] = command_name
+
+            uppercase_alias = _wrapper_upper_alias(wrapper_name)
+            if uppercase_alias and uppercase_alias not in expanded_wrapper_targets:
+                expanded_wrapper_targets[uppercase_alias] = command_name
+
+        wrapper_targets = expanded_wrapper_targets
+
+    expected_commands = set(wrapper_targets.keys())
+
+    if plat == "nt":
+        expected_files = {
+            f"{name}{suffix}" for name in expected_commands for suffix in (".cmd", ".ps1")
+        }
+    else:
+        expected_files = set(expected_commands)
+
+    try:
+        existing_files = os.listdir(target_dir)
+    except OSError as exc:
+        reason = exc.strerror or str(exc)
+        errors.append(f"failed to list wrapper directory '{target_dir}': {reason}")
+        existing_files = []
+
+    if prune_stale:
+        for filename in existing_files:
+            path = os.path.join(target_dir, filename)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as fd:
+                    header = fd.read(160)
+                if WRAPPER_MARKER in header and filename not in expected_files:
+                    os.remove(path)
+            except OSError as exc:
+                reason = exc.strerror or str(exc)
+                errors.append(f"failed to reconcile wrapper '{path}': {reason}")
+
+    if uninstall:
+        return errors
+
+    wrapper_target = os.path.realpath(__file__)
+    if not os.path.isfile(wrapper_target):
+        wrapper_target = (
+            os.path.realpath(sys.argv[0]) if os.path.isfile(sys.argv[0]) else PRIMARY_WRAPPER
+        )
+    python_q = _cmd_quote(sys.executable)
+    target_q = _cmd_quote(wrapper_target)
+    wrapper_target_q = shlex.quote(wrapper_target)
+
+    for entry, command_name in wrapper_targets.items():
+        if command_name is None:
+            unix_exec_line = f'exec {wrapper_target_q} "$@"\n'
+            cmd_forward = "%*"
+            ps1_forward = "@args"
+        else:
+            command_name_q = shlex.quote(command_name)
+            entry_q = shlex.quote(entry)
+            unix_exec_line = (
+                f"COMMANDS_WRAPPER_WRAPPER_ENTRY=1 "
+                f"COMMANDS_WRAPPER_WRAPPER_NAME={entry_q} "
+                f'exec {wrapper_target_q} {command_name_q} "$@"\n'
+            )
+            cmd_forward = f"{_cmd_quote(command_name)} %*"
+            ps1_forward = f"{_cmd_quote(command_name)} @args"
+
+        if plat == "nt":
+            cmd_path = os.path.join(target_dir, f"{entry}.cmd")
+            ps1_path = os.path.join(target_dir, f"{entry}.ps1")
+
+            cmd_content = f"@echo off\nREM {WRAPPER_MARKER}\n{python_q} {target_q} {cmd_forward}\n"
+            ps1_content = (
+                f"# {WRAPPER_MARKER}\n"
+                f"& {_cmd_quote(sys.executable)} {_cmd_quote(wrapper_target)} {ps1_forward}\n"
+            )
+
+            for wrapper_path, content in ((cmd_path, cmd_content), (ps1_path, ps1_content)):
+                try:
+                    _atomic_write_text(wrapper_path, content)
+                except OSError as exc:
+                    reason = exc.strerror or str(exc)
+                    errors.append(f"failed to write wrapper '{wrapper_path}': {reason}")
+        else:
+            script_path = os.path.join(target_dir, entry)
+            content = f"#!/usr/bin/env sh\n# {WRAPPER_MARKER}\n{unix_exec_line}"
+            try:
+                _atomic_write_text(script_path, content)
+                st = os.stat(script_path)
+                os.chmod(script_path, st.st_mode | stat.S_IEXEC)
+            except OSError as exc:
+                reason = exc.strerror or str(exc)
+                errors.append(f"failed to write wrapper '{script_path}': {reason}")
+
+    return errors
+
+
+def save_cmd(name: str, cfg: Dict[str, Any], file_path: str) -> Tuple[bool, List[str]]:
+    validation_error = _validate_command_config(cfg)
+    if validation_error:
+        return False, [f"invalid command '{name}': {validation_error}"]
+
+    parent = os.path.dirname(file_path)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as exc:
+            return False, [f"failed to create command directory '{parent}': {exc}"]
+
+    try:
+        with _exclusive_file_lock(file_path):
+            data: Dict[str, Any] = {}
+            if os.path.exists(file_path):
+                try:
+                    loaded = _load_command_yaml_file(file_path)
+                except OSError as exc:
+                    return False, [f"failed to read command file '{file_path}': {exc}"]
+                except yaml.YAMLError as exc:
+                    return False, [f"failed to parse command file '{file_path}': {exc}"]
+                if isinstance(loaded, dict):
+                    data = loaded
+
+            all_commands = load_cmds(find_yamls())
+            conflict_name = _find_case_insensitive_conflict(
+                name,
+                list(all_commands.keys()),
+                ignore_name=name,
+            )
+            if conflict_name:
+                return False, [
+                    f"command name '{name}' conflicts with existing command '{conflict_name}' under case-insensitive lookup"
+                ]
+
+            clean_cfg = {k: v for k, v in cfg.items() if k != "_source"}
+            data[name] = clean_cfg
+            try:
+                content = yaml.safe_dump(data, sort_keys=False)
+                _atomic_write_text(file_path, content)
+            except (OSError, yaml.YAMLError) as exc:
+                return False, [f"failed to write command file '{file_path}': {exc}"]
+    except OSError as exc:
+        return False, [f"failed to lock command file '{file_path}': {exc}"]
+
+    sync_db, sync_load_warnings = _load_commands_for_sync()
+    return True, _sync_messages_with_load_warnings(
+        sync_db,
+        sync_load_warnings,
+        prune_stale=False,
+    )
+
+
+def remove_from_file(name: str, file_path: str) -> Tuple[bool, str, List[str]]:
+    if not os.path.exists(file_path):
+        return False, f"source file not found: {file_path}", []
+
+    try:
+        with _exclusive_file_lock(file_path):
+            loaded = _load_command_yaml_file(file_path)
+            data = loaded if isinstance(loaded, dict) else {}
+
+            if name not in data:
+                return False, f"'{name}' not found in source file", []
+
+            del data[name]
+            content = yaml.safe_dump(data, sort_keys=False)
+            _atomic_write_text(file_path, content)
+    except (OSError, yaml.YAMLError) as exc:
+        return False, f"failed to update source file: {exc}", []
+
+    sync_db, sync_load_warnings = _load_commands_for_sync()
+    sync_messages = _sync_messages_with_load_warnings(
+        sync_db,
+        sync_load_warnings,
+        prune_stale=True,
+    )
+    return True, "", sync_messages
+
+
+def rename_in_file(old_name: str, new_name: str, file_path: str) -> Tuple[bool, str, List[str]]:
+    if not os.path.exists(file_path):
+        return False, f"source file not found: {file_path}", []
+
+    try:
+        with _exclusive_file_lock(file_path):
+            loaded = _load_command_yaml_file(file_path)
+            data = loaded if isinstance(loaded, dict) else {}
+
+            if old_name not in data:
+                return False, f"'{old_name}' not found in source file", []
+
+            all_commands = load_cmds(find_yamls())
+            conflict_name = _find_case_insensitive_conflict(
+                new_name,
+                list(all_commands.keys()),
+                ignore_name=old_name,
+            )
+            if conflict_name:
+                return (
+                    False,
+                    f"'{new_name}' conflicts with existing command '{conflict_name}' under case-insensitive lookup",
+                    [],
+                )
+
+            if new_name != old_name and new_name in data:
+                return False, f"'{new_name}' already exists in source file", []
+
+            if new_name != old_name:
+                data[new_name] = data.pop(old_name)
+
+            content = yaml.safe_dump(data, sort_keys=False)
+            _atomic_write_text(file_path, content)
+    except (OSError, yaml.YAMLError) as exc:
+        return False, f"failed to update source file: {exc}", []
+
+    sync_db, sync_load_warnings = _load_commands_for_sync()
+    sync_messages = _sync_messages_with_load_warnings(
+        sync_db,
+        sync_load_warnings,
+        prune_stale=True,
+    )
+    return True, "", sync_messages
+
+
+def _is_valid_name(name: str) -> bool:
+    """Command names must be non-empty and contain only safe characters."""
+    return bool(name) and all(c.isalnum() or c in "-_ " for c in name) and not name.isspace()
+
+
+def _wizard_add(win) -> str:
+    fields = [
+        Field("name", "Command"),
+        Field("desc", "Description"),
+        Field("timeout", "Timeout in seconds (optional)"),
+    ]
+
+    while True:
+        res = form_input(win, "Add command", fields)
+        if not res:
+            return "cancelled"
+
+        name = res["name"].strip()
+        if not _is_valid_name(name):
+            y = _draw_header(win, "Add command")
+            _addstr(
+                win, y, 4, "Invalid command name. Use letters, numbers, spaces, '-' or '_'.", ERR()
+            )
+            _addstr(win, y + 2, 4, "Press any key to continue.", DIM())
+            win.refresh()
+            win.getch()
+            continue
+
+        existing = load_cmds(find_yamls())
+        conflict_name = _find_case_insensitive_conflict(name, list(existing.keys()))
+        if conflict_name:
+            y = _draw_header(win, "Add command")
+            if conflict_name == name:
+                _addstr(win, y, 4, f"Command '{name}' already exists.", ERR())
+            else:
+                _addstr(
+                    win,
+                    y,
+                    4,
+                    f"Command '{name}' conflicts with '{conflict_name}' under case-insensitive lookup.",
+                    ERR(),
+                )
+            _addstr(win, y + 2, 4, "Use edit mode from the command list to update it.", DIM())
+            _addstr(win, y + 4, 4, "Press any key to continue.", DIM())
+            win.refresh()
+            win.getch()
+            continue
+
+        steps = steps_editor(win, [])
+        if steps is None:
+            return "cancelled"
+
+        timeout = res["timeout"].strip()
+        steps_key = f"steps {timeout}" if timeout else "steps"
+        try:
+            _parse_timeout(steps_key)
+        except ValueError:
+            y = _draw_header(win, "Add command")
+            _addstr(win, y, 4, "Invalid timeout. Use a positive integer or leave empty.", ERR())
+            _addstr(win, y + 2, 4, "Press any key to continue.", DIM())
+            win.refresh()
+            win.getch()
+            continue
+
+        target = _preferred_command_file_for_write()
+        saved, sync_messages = save_cmd(
+            name, {"description": res["desc"].strip(), steps_key: steps}, target
+        )
+        if not saved:
+            error_message = _first_non_warning_message(sync_messages) or "Failed to save command."
+            y = _draw_header(win, "Add command")
+            _addstr(win, y, 4, error_message, ERR())
+            _addstr(win, y + 2, 4, f"Target file: {target}", DIM())
+            _addstr(win, y + 4, 4, "Press any key to continue.", DIM())
+            win.refresh()
+            win.getch()
+            continue
+
+        if _report_sync_messages(sync_messages, emit=False):
+            return "saved_with_sync_issues"
+        return "saved"
+
+
+def _menu_line_for_command(name: str, cfg: Dict[str, Any]) -> str:
+    name_col = name if len(name) <= 24 else f"{name[:21]}..."
+    desc = str(cfg.get("description", "")).strip()
+    if not desc:
+        return f"{name_col:<24} |"
+    short_desc = desc if len(desc) <= 56 else f"{desc[:53]}..."
+    return f"{name_col:<24} | {short_desc}"
+
+
+def _wizard_edit_command(win, name: str) -> str:
+    status = ""
+    current_name = name
+
+    while True:
+        db = load_cmds(find_yamls())
+        cfg = db.get(current_name)
+        if not cfg:
+            return f"OK: Removed '{current_name}'."
+
+        action = menu(
+            win,
+            f"Edit - {current_name}",
+            [
+                "Rename command",
+                "Edit metadata",
+                "Edit steps",
+                "Delete",
+                "Back",
+            ],
+            status,
+        )
+        status = ""
+
+        if action is None or action == 4:
+            return ""
+
+        if action == 0:
+            res = form_input(
+                win, f"Rename - {current_name}", [Field("name", "Command name", value=current_name)]
+            )
+            if not res:
+                continue
+
+            new_name = res["name"].strip()
+            if not _is_valid_name(new_name):
+                status = "ERR: Invalid command name"
+                continue
+
+            conflict_name = _find_case_insensitive_conflict(
+                new_name,
+                list(db.keys()),
+                ignore_name=current_name,
+            )
+            if conflict_name:
+                if conflict_name == new_name:
+                    status = f"ERR: Command '{new_name}' already exists"
+                else:
+                    status = (
+                        f"ERR: Command '{new_name}' conflicts with '{conflict_name}' "
+                        "under case-insensitive lookup"
+                    )
+                continue
+
+            renamed, err_message, sync_messages = rename_in_file(
+                current_name, new_name, cfg["_source"]
+            )
+            if not renamed:
+                status = f"ERR: {err_message}"
+                continue
+
+            current_name = new_name
+            status = "OK: Command renamed."
+            if _report_sync_messages(sync_messages, emit=False):
+                status = "WARN: Command renamed with sync issues."
+
+        elif action == 1:
+            old_steps_key = next((k for k in cfg if str(k).startswith("steps")), "steps")
+            old_timeout = str(old_steps_key).replace("steps", "").strip()
+
+            fields = [
+                Field("desc", "Description", value=cfg.get("description", "")),
+                Field("timeout", "Timeout (seconds)", value=old_timeout),
+            ]
+            res = form_input(win, f"Edit metadata - {current_name}", fields)
+            if not res:
+                continue
+
+            cfg["description"] = res["desc"].strip()
+            timeout = res["timeout"].strip()
+            steps_key = f"steps {timeout}" if timeout else "steps"
+            try:
+                _parse_timeout(steps_key)
+            except ValueError:
+                status = "ERR: Timeout must be a positive integer"
+                continue
+
+            if steps_key != old_steps_key:
+                cfg[steps_key] = cfg.pop(old_steps_key)
+
+            saved, sync_messages = save_cmd(current_name, cfg, cfg["_source"])
+            if not saved:
+                status = (
+                    f"ERR: {_first_non_warning_message(sync_messages) or 'failed to save metadata'}"
+                )
+                continue
+
+            status = "OK: Metadata updated."
+            if _report_sync_messages(sync_messages, emit=False):
+                status = "WARN: Metadata saved with sync issues."
+
+        elif action == 2:
+            old_steps_key = next((k for k in cfg if str(k).startswith("steps")), "steps")
+            existing_steps = cfg.get(old_steps_key, [])
+            steps = steps_editor(win, existing_steps)
+            if steps is not None:
+                cfg[old_steps_key] = steps
+                saved, sync_messages = save_cmd(current_name, cfg, cfg["_source"])
+                if not saved:
+                    status = f"ERR: {_first_non_warning_message(sync_messages) or 'failed to save steps'}"
+                    continue
+
+                status = "OK: Steps updated."
+                if _report_sync_messages(sync_messages, emit=False):
+                    status = "WARN: Steps saved with sync issues."
+
+        elif action == 3:
+            confirm = menu(win, f"Delete '{current_name}'?", ["Cancel", "Delete"])
+            if confirm == 1:
+                removed, err_message, sync_messages = remove_from_file(current_name, cfg["_source"])
+                if not removed:
+                    status = f"ERR: {err_message}"
+                    continue
+
+                if _report_sync_messages(sync_messages, emit=False):
+                    return f"WARN: Removed '{current_name}' with sync issues."
+                return f"OK: Removed '{current_name}'."
+
+
+def _wizard_main(win):
+    global _WIZARD_STARTUP_STATUS
+
+    _configure_escape_key_delay()
+    _init_colors()
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+
+    win.keypad(True)
+    win.timeout(-1)
+
+    status = _WIZARD_STARTUP_STATUS or ""
+    _WIZARD_STARTUP_STATUS = None
+    startup_sync_done = False
+    while True:
+        db_load_warnings: List[str] = []
+        db = load_cmds(find_yamls(), warnings=db_load_warnings)
+        if not startup_sync_done:
+            auto_sync_messages = _sync_messages_with_load_warnings(
+                db,
+                db_load_warnings,
+                prune_stale=False,
+            )
+            auto_sync_has_errors = _report_sync_messages(auto_sync_messages, emit=False)
+            auto_sync_has_warnings = any(msg.startswith("WARN: ") for msg in auto_sync_messages)
+
+            if not status:
+                if auto_sync_has_errors:
+                    status = "WARN: Automatic wrapper sync had errors."
+                elif db_load_warnings:
+                    status = (
+                        "WARN: Command-file warnings detected; stale wrapper cleanup is paused."
+                    )
+                elif auto_sync_has_warnings:
+                    status = "WARN: Some naked wrappers are disabled due to command conflicts."
+
+            startup_sync_done = True
+
+        command_names = sorted(db.keys())
+        if not command_names and not status:
+            status = "INFO: No commands yet. Add one to get started."
+
+        options = ["+ Add new command"]
+        if command_names:
+            options.extend(_menu_line_for_command(name, db[name]) for name in command_names)
+        options.extend(
+            [
+                "Refresh list",
+                "Exit",
+            ]
+        )
+
+        command_count = len(command_names)
+        first_command_idx = 1
+        refresh_idx = first_command_idx + command_count
+        exit_idx = refresh_idx + 1
+
+        choice = menu(win, "Command wrappers (Enter edits)", options, status)
+        status = ""
+
+        if choice is None or choice == exit_idx:
+            break
+
+        if choice == 0:
+            add_result = _wizard_add(win)
+            if add_result == "saved":
+                status = "OK: Command saved."
+            elif add_result == "saved_with_sync_issues":
+                status = "WARN: Command saved, but wrapper sync had errors."
+            else:
+                status = "WARN: Add command canceled."
+            continue
+
+        if choice == refresh_idx:
+            status = "OK: Refreshed."
+            startup_sync_done = False
+            continue
+
+        if command_count == 0:
+            status = "INFO: No commands yet. Add one to get started."
+            continue
+
+        selected_idx = choice - first_command_idx
+        if selected_idx < 0 or selected_idx >= command_count:
+            continue
+
+        selected_name = command_names[selected_idx]
+        status = _wizard_edit_command(win, selected_name)
+
+
+def _run_basic_wizard(startup_status: str = "") -> None:
+    print(f"{ANSI_BOLD}{HEADER_TITLE}{ANSI_RESET}")
+    if startup_status:
+        print(startup_status.replace("INFO: ", ""))
+    print("Terminal UI is unavailable on this platform or shell.")
+    print("Use non-interactive commands instead:")
+    print(f"  {PRIMARY_WRAPPER} add --yaml <<EOF")
+    print("  ...")
+    print("  EOF")
+    print(f"  {PRIMARY_WRAPPER} list")
+    print(f"  {PRIMARY_WRAPPER} remove <name>")
+
+
+def _strip_add_yaml_flag(argv: List[str]) -> Tuple[List[str], bool]:
+    if len(argv) < 2 or argv[1].casefold() != "add":
+        return list(argv), False
+
+    filtered = [argv[0]]
+    has_yaml_flag = False
+    for part in argv[1:]:
+        if isinstance(part, str) and part.casefold() == "--yaml":
+            has_yaml_flag = True
+            continue
+        filtered.append(part)
+    return filtered, has_yaml_flag
+
+
+def run_wizard(startup_status: str = ""):
+    global _WIZARD_STARTUP_STATUS
+
+    _WIZARD_STARTUP_STATUS = startup_status or None
+    if not _has_tui_support():
+        _run_basic_wizard(startup_status=startup_status)
+        return
+
+    try:
+        curses.wrapper(_wizard_main)
+    except KeyboardInterrupt:
+        pass
+
+
+def _pip_install_scope_args() -> List[str]:
+    """Return the safest pip scope for the active interpreter."""
+    in_venv = getattr(sys, "base_prefix", sys.prefix) != sys.prefix
+    return [] if in_venv else ["--user"]
+
+
+def _run_pip(args: List[str], cwd: Optional[str] = None, suppress_output: bool = False) -> int:
+    base = [sys.executable, "-m", "pip", *args]
+    kwargs: Dict[str, Any] = {"cwd": cwd, "check": False}
+    if suppress_output:
+        kwargs["stdout"] = subprocess.DEVNULL
+        kwargs["stderr"] = subprocess.DEVNULL
+
+    result = subprocess.run(base, **kwargs)
+    if result.returncode == 0:
+        return 0
+
+    if not _env_flag_enabled("COMMANDS_WRAPPER_ALLOW_BREAK_SYSTEM_PACKAGES"):
+        return result.returncode
+
+    retry = subprocess.run([*base, "--break-system-packages"], **kwargs)
+    return retry.returncode
+
+
+def _extract_cd_target(command: Any) -> Optional[str]:
+    if not isinstance(command, str):
+        return None
+
+    try:
+        parts = shlex.split(command, posix=(os.name != "nt"))
+    except ValueError:
+        return None
+
+    if not parts or parts[0] != "cd":
+        return None
+
+    if len(parts) == 1:
+        return "~"
+
+    if len(parts) == 2:
+        return parts[1]
+
+    return None
+
+
+def _resolve_cd_target(target: str) -> str:
+    if target == "-":
+        previous = os.environ.get("OLDPWD")
+        if not previous:
+            raise ValueError("OLDPWD is not set for 'cd -'.")
+        target = previous
+
+    expanded = os.path.expandvars(os.path.expanduser(target))
+    if not os.path.isabs(expanded):
+        expanded = os.path.abspath(os.path.join(os.getcwd(), expanded))
+    return expanded
+
+
+def _change_directory(target: str) -> None:
+    destination = _resolve_cd_target(target)
+    if not os.path.isdir(destination):
+        raise ValueError(f"directory does not exist: {destination}")
+
+    previous = os.getcwd()
+    try:
+        os.chdir(destination)
+    except OSError as exc:
+        reason = exc.strerror or str(exc)
+        raise ValueError(f"unable to cd into '{target}': {reason}") from exc
+
+    os.environ["OLDPWD"] = previous
+    os.environ["PWD"] = os.getcwd()
+
+
+def _is_single_cd_step(steps: List[Any]) -> bool:
+    if len(steps) != 1:
+        return False
+    step = steps[0]
+    if not isinstance(step, dict):
+        return False
+    return _extract_cd_target(step.get("command")) is not None
+
+
+def _open_interactive_shell() -> None:
+    shell = _shell_name()
+    args = [shell]
+    if os.name != "nt":
+        args.append("-i")
+    try:
+        subprocess.run(args, cwd=os.getcwd(), check=False)
+    except OSError as exc:
+        reason = exc.strerror or str(exc)
+        raise ValueError(f"unable to open interactive shell: {reason}") from exc
+
+
+class StepTimeoutError(RuntimeError):
+    """Raised when a command step exceeds its timeout."""
+
+
+class CommandStepFailedError(RuntimeError):
+    """Raised when a command step exits with a non-zero status."""
+
+    def __init__(self, command: str, exit_code: int):
+        self.command = command
+        self.exit_code = exit_code
+        super().__init__(f"command failed with exit code {exit_code}: {command}")
+
+
+class ProcessAdapter:
+    def __init__(self, command: str, timeout: Optional[int]):
+        self._command = command
+        self._deadline = time.monotonic() + float(timeout) if timeout is not None else None
+
+    def remaining_timeout(self) -> Optional[float]:
+        deadline = getattr(self, "_deadline", None)
+        if deadline is None:
+            return None
+        return max(0.0, float(deadline) - time.monotonic())
+
+    def check_timeout(self) -> None:
+        remaining = self.remaining_timeout()
+        if remaining is not None and remaining <= 0:
+            self.terminate_for_timeout()
+            raise StepTimeoutError
+
+    def terminate_for_timeout(self) -> None:
+        self.close()
+
+    def isalive(self) -> bool:
+        raise NotImplementedError
+
+    def interact(self) -> None:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        raise NotImplementedError
+
+    def sendline(self, text: str = "") -> None:
+        raise NotImplementedError
+
+    def send(self, text: str) -> None:
+        raise NotImplementedError
+
+    def returncode(self) -> Optional[int]:
+        raise NotImplementedError
+
+    def command_text(self) -> str:
+        raise NotImplementedError
+
+
+class _PExpectLogSink:
+    def __init__(self, stream: Any):
+        self._stream = stream
+        self._buffer = getattr(stream, "buffer", None)
+
+    def write(self, data: Any) -> int:
+        if isinstance(data, bytes):
+            if self._buffer is not None:
+                self._buffer.write(data)
+                return len(data)
+
+            text = data.decode("utf-8", errors="replace")
+            self._stream.write(text)
+            return len(data)
+
+        text = str(data)
+        self._stream.write(text)
+        return len(text)
+
+    def flush(self) -> None:
+        if self._buffer is not None:
+            try:
+                self._buffer.flush()
+            except (OSError, ValueError, AttributeError):
+                pass
+
+        try:
+            self._stream.flush()
+        except (OSError, ValueError, AttributeError):
+            pass
+
+
+class PExpectProcessAdapter(ProcessAdapter):
+    def __init__(self, command: str, timeout: Optional[int]):
+        super().__init__(command, timeout)
+        self._proc = pexpect.spawn(
+            _shell_name(),
+            ["-c", command],
+            encoding="utf-8",
+            codec_errors="replace",
+            timeout=timeout,
+        )
+        self._log_sink = _PExpectLogSink(sys.stdout)
+        self._timed_out = threading.Event()
+
+    def _expire(self) -> None:
+        timed_out = getattr(self, "_timed_out", None)
+        if timed_out is None:
+            timed_out = threading.Event()
+            self._timed_out = timed_out
+        timed_out.set()
+        _terminate_process_tree(getattr(self._proc, "pid", None))
+
+    def isalive(self) -> bool:
+        return self._proc.isalive()
+
+    def interact(self) -> None:
+        if not hasattr(self, "_timed_out"):
+            self._timed_out = threading.Event()
+        self.check_timeout()
+        remaining = self.remaining_timeout()
+        timeout_timer: Optional[threading.Timer] = None
+        if remaining is not None:
+            timeout_timer = threading.Timer(remaining, self._expire)
+            timeout_timer.daemon = True
+            timeout_timer.start()
+
+        try:
+            self._proc.interact()
+            if self._timed_out.is_set():
+                raise StepTimeoutError
+            return
+        except pexpect.TIMEOUT as exc:
+            raise StepTimeoutError from exc
+        except NON_INTERACTIVE_INTERACT_EXCEPTIONS:
+            # Non-interactive shells (CI, pipes) cannot attach a TTY.
+            if self._timed_out.is_set():
+                raise StepTimeoutError from None
+        finally:
+            if timeout_timer is not None:
+                timeout_timer.cancel()
+
+        previous_logfile_read = getattr(self._proc, "logfile_read", None)
+        self._proc.logfile_read = self._log_sink
+        try:
+            self.check_timeout()
+            self._proc.expect(pexpect.EOF, timeout=self.remaining_timeout())
+        except pexpect.TIMEOUT as exc:
+            self._expire()
+            raise StepTimeoutError from exc
+        finally:
+            self._proc.logfile_read = previous_logfile_read
+
+    def close(self) -> None:
+        if self.isalive():
+            _terminate_process_tree(getattr(self._proc, "pid", None))
+        self._proc.close()
+
+    def sendline(self, text: str = "") -> None:
+        self._proc.sendline(text)
+
+    def send(self, text: str) -> None:
+        self._proc.send(text)
+
+    def returncode(self) -> Optional[int]:
+        if self._proc.exitstatus is not None:
+            return self._proc.exitstatus
+        if self._proc.signalstatus is not None:
+            return 128 + self._proc.signalstatus
+        return None
+
+    def command_text(self) -> str:
+        return self._command
+
+
+class SubprocessProcessAdapter(ProcessAdapter):
+    def __init__(self, command: str, timeout: Optional[int]):
+        super().__init__(command, timeout)
+        kwargs: Dict[str, Any] = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "bufsize": 1,
+            "shell": True,
+        }
+        if os.name != "nt":
+            kwargs["executable"] = _shell_name()
+            kwargs["start_new_session"] = True
+        self._proc = subprocess.Popen(command, **kwargs)
+        self._reader_done = threading.Event()
+        self._reader = threading.Thread(target=self._pump_stdout, daemon=True)
+        self._reader.start()
+
+    def _pump_stdout(self) -> None:
+        try:
+            if not self._proc.stdout:
+                return
+            for line in self._proc.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+        finally:
+            self._reader_done.set()
+
+    def isalive(self) -> bool:
+        return self._proc.poll() is None
+
+    def interact(self) -> None:
+        self.check_timeout()
+        try:
+            self._proc.wait(timeout=self.remaining_timeout())
+        except subprocess.TimeoutExpired as exc:
+            self.terminate_for_timeout()
+            raise StepTimeoutError from exc
+        finally:
+            self._reader_done.wait(timeout=0.5)
+
+    def close(self) -> None:
+        if self.isalive():
+            _terminate_process_tree(self._proc.pid)
+            try:
+                self._proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                _terminate_process_tree(self._proc.pid, force=True)
+                self._proc.wait(timeout=2)
+        self._reader_done.wait(timeout=0.5)
+
+        for stream in (self._proc.stdin, self._proc.stdout, self._proc.stderr):
+            try:
+                if stream:
+                    stream.close()
+            except (OSError, ValueError):
+                pass
+
+    def sendline(self, text: str = "") -> None:
+        self.send(text + "\n")
+
+    def send(self, text: str) -> None:
+        self.check_timeout()
+        if not self._proc.stdin:
+            raise ValueError("cannot send input to command without stdin")
+        if not self.isalive():
+            raise ValueError("cannot send input: process already exited")
+        self._proc.stdin.write(text)
+        self._proc.stdin.flush()
+
+    def returncode(self) -> Optional[int]:
+        return self._proc.returncode
+
+    def command_text(self) -> str:
+        return self._command
+
+
+def _safe_exit_code(code: int) -> int:
+    if 0 < code < 256:
+        return code
+    return 1
+
+
+def _terminate_process_tree(pid: Optional[int], *, force: bool = False) -> None:
+    if not pid or pid <= 0:
+        return
+
+    sig = signal.SIGKILL if force else signal.SIGTERM
+    if os.name != "nt":
+        try:
+            process_group = os.getpgid(pid)
+        except (OSError, ProcessLookupError):
+            return
+
+        try:
+            if process_group == pid:
+                os.killpg(process_group, sig)
+            else:
+                os.kill(pid, sig)
+        except (OSError, ProcessLookupError):
+            return
+        return
+
+    taskkill_args = ["taskkill", "/PID", str(pid), "/T"]
+    if force:
+        taskkill_args.append("/F")
+    try:
+        subprocess.run(
+            taskkill_args,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        try:
+            os.kill(pid, sig)
+        except (OSError, ProcessLookupError):
+            return
+
+
+def _check_process_timeout(proc: Optional[ProcessAdapter]) -> None:
+    if proc is None:
+        return
+    checker = getattr(proc, "check_timeout", None)
+    if callable(checker):
+        checker()
+
+
+def _remaining_process_timeout(proc: Optional[ProcessAdapter]) -> Optional[float]:
+    if proc is None:
+        return None
+    getter = getattr(proc, "remaining_timeout", None)
+    if not callable(getter):
+        return None
+    remaining = getter()
+    return float(remaining) if remaining is not None else None
+
+
+def _finalize_process(proc: ProcessAdapter) -> None:
+    try:
+        proc.interact()
+    finally:
+        proc.close()
+
+    code = proc.returncode()
+    display_command = _display_command_text(proc.command_text())
+    if code is None:
+        raise ValueError(f"unable to determine exit status for command: {display_command}")
+    if code != 0:
+        raise CommandStepFailedError(display_command, code)
+
+
+def _spawn_process(command: str, timeout: Optional[int]) -> ProcessAdapter:
+    try:
+        if PEXPECT_AVAILABLE and os.name != "nt":
+            return PExpectProcessAdapter(command, timeout)
+        return SubprocessProcessAdapter(command, timeout)
+    except SPAWN_PROCESS_EXCEPTIONS as exc:
+        raise ValueError(f"unable to start command process: {exc}") from exc
+
+
+def run_step(proc: Optional[ProcessAdapter], ctx: Dict[str, Any], timeout: Optional[int]):
+    if "command" in ctx:
+        command_text = str(ctx["command"])
+        cd_target = _extract_cd_target(command_text)
+
+        if proc is not None:
+            _finalize_process(proc)
+
+        if cd_target is not None:
+            _change_directory(cd_target)
+            return None
+
+        display_command_text = _display_command_text(command_text)
+        print(f"\n{ANSI_MUTED}$ {ANSI_RESET}{display_command_text}")
+        return _spawn_process(command_text, timeout)
+
+    if "send" in ctx:
+        if not proc:
+            raise ValueError("'send' step requires a running command step")
+        try:
+            _check_process_timeout(proc)
+            proc.sendline(str(ctx["send"]))
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"unable to send input to running command: {exc}") from exc
+        return proc
+
+    if "press_key" in ctx:
+        if not proc:
+            raise ValueError("'press_key' step requires a running command step")
+        raw_key = str(ctx["press_key"])
+        key_name = raw_key.strip().casefold()
+        try:
+            _check_process_timeout(proc)
+            if key_name in ("enter", "return"):
+                proc.sendline()
+            elif key_name == "tab":
+                proc.send("\t")
+            elif key_name in ("esc", "escape"):
+                proc.send("\x1b")
+            else:
+                proc.send(raw_key)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"unable to send input to running command: {exc}") from exc
+        return proc
+
+    if "wait" in ctx:
+        try:
+            duration = float(ctx["wait"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid wait duration: {ctx['wait']}") from exc
+        if duration < 0:
+            raise ValueError(f"wait duration must be non-negative: {ctx['wait']}")
+        remaining = _remaining_process_timeout(proc)
+        if remaining is not None and duration >= remaining:
+            time.sleep(remaining)
+            if proc is not None:
+                proc.terminate_for_timeout()
+            raise StepTimeoutError
+        time.sleep(duration)
+        _check_process_timeout(proc)
+        return proc
+
+    raise ValueError(f"invalid step object: {ctx}")
+
+
+def exec_cmd(
+    name: str,
+    cfg: Dict[str, Any],
+    *,
+    allow_single_cd_shell: bool = True,
+) -> None:
+    key = _get_steps_key(cfg)
+    if not key:
+        _error(f"'{name}' has no steps configured.")
+        sys.exit(1)
+
+    try:
+        t = _parse_timeout(key)
+    except ValueError as exc:
+        _error(str(exc))
+        sys.exit(1)
+
+    steps = cfg.get(key)
+    validation_error = _validate_steps(steps)
+    if validation_error or not isinstance(steps, list):
+        detail = validation_error or "steps value must be a list"
+        _error(f"'{name}' has an invalid steps definition: {detail}.")
+        sys.exit(1)
+
+    single_cd_step = _is_single_cd_step(steps)
+
+    proc: Optional[ProcessAdapter] = None
+    try:
+        for s in steps:
+            if not isinstance(s, dict):
+                raise ValueError(f"invalid step in '{name}': expected mapping")
+            proc = run_step(proc, s, t)
+    except ValueError as exc:
+        _error(str(exc))
+        sys.exit(1)
+    except CommandStepFailedError as exc:
+        _error(str(exc))
+        sys.exit(_safe_exit_code(exc.exit_code))
+    except StepTimeoutError:
+        _error(f"command '{name}' timed out.")
+        sys.exit(1)
+
+    if proc is not None:
+        try:
+            _finalize_process(proc)
+        except CommandStepFailedError as exc:
+            _error(str(exc))
+            sys.exit(_safe_exit_code(exc.exit_code))
+        except StepTimeoutError:
+            _error(f"command '{name}' timed out.")
+            sys.exit(1)
+        except ValueError as exc:
+            _error(str(exc))
+            sys.exit(1)
+    elif single_cd_step and allow_single_cd_shell and sys.stdin.isatty() and sys.stdout.isatty():
+        try:
+            _open_interactive_shell()
+        except ValueError as exc:
+            _error(str(exc))
+            sys.exit(1)
+
+
+def _command_uses_single_cd(cfg: Dict[str, Any]) -> bool:
+    steps_key = _get_steps_key(cfg)
+    if not steps_key:
+        return False
+
+    steps = cfg.get(steps_key)
+    return isinstance(steps, list) and _is_single_cd_step(steps)
+
+
+def _normalize_followup_parts(parts: List[str]) -> List[str]:
+    if parts and parts[0] == "--":
+        return parts[1:]
+    return parts
+
+
+def _run_followup_after_cd(
+    base_command_name: str,
+    followup_parts: List[str],
+    db: Dict[str, Dict[str, Any]],
+    lookup_index: Dict[str, str],
+) -> None:
+    normalized_followup_parts = _normalize_followup_parts(followup_parts)
+    followup_text = " ".join(normalized_followup_parts).strip()
+    if not followup_text:
+        raise ValueError(
+            f"'{base_command_name}' requires a follow-up command when extra tokens are provided"
+        )
+
+    resolved_followup = _resolve_command_name(followup_text, db, lookup_index)
+    if resolved_followup:
+        exec_cmd(resolved_followup, db[resolved_followup])
+        return
+
+    display_followup_text = _display_command_text(followup_text)
+    print(f"\n{ANSI_MUTED}$ {ANSI_RESET}{display_followup_text}")
+    proc = _spawn_process(followup_text, timeout=None)
+    try:
+        _finalize_process(proc)
+    except CommandStepFailedError as exc:
+        _error(str(exc))
+        sys.exit(_safe_exit_code(exc.exit_code))
+    except StepTimeoutError:
+        _error(f"follow-up command after '{base_command_name}' timed out.")
+        sys.exit(1)
+    except ValueError as exc:
+        _error(str(exc))
+        sys.exit(1)
+
+
+def _single_cd_destination_for_command(
+    name: str,
+    db: Dict[str, Dict[str, Any]],
+    lookup_index: Dict[str, str],
+) -> Optional[str]:
+    resolved_name = _resolve_command_name(name, db, lookup_index)
+    if not resolved_name:
+        return None
+
+    cfg = db.get(resolved_name)
+    if not isinstance(cfg, dict):
+        return None
+
+    steps_key = _get_steps_key(cfg)
+    if not steps_key:
+        return None
+
+    steps = cfg.get(steps_key)
+    if not isinstance(steps, list) or not _is_single_cd_step(steps):
+        return None
+
+    step = steps[0]
+    if not isinstance(step, dict):
+        return None
+
+    cd_target = _extract_cd_target(step.get("command"))
+    if cd_target is None:
+        return None
+
+    return _resolve_cd_target(cd_target)
+
+
+def _expect_no_extra_action_parts(action_parts: List[str], usage: str) -> None:
+    if len(action_parts) > 1:
+        _error(usage)
+        sys.exit(1)
+
+
+def _is_posix_function_name(name: str) -> bool:
+    if not name:
+        return False
+
+    first = name[0]
+    if not (first.isalpha() or first == "_"):
+        return False
+
+    return all(c.isalnum() or c == "_" for c in name[1:])
+
+
+def print_list(db: Dict):
+    print(f"{ANSI_BOLD}{HEADER_TITLE}{ANSI_RESET}")
+    if not db:
+        print(f"{ANSI_MUTED}No commands found.{ANSI_RESET}")
+        return
+    print(f"{ANSI_BOLD}{'NAME':<22} DESCRIPTION{ANSI_RESET}")
+    print(f"{ANSI_MUTED}{'-' * 72}{ANSI_RESET}")
+    for k, v in sorted(db.items()):
+        print(f"{ANSI_PRIMARY}{k:<22}{ANSI_RESET} {v.get('description', '')}")
+    print()
+
+
+def _read_bounded_yaml_stdin() -> str:
+    binary_stream = getattr(sys.stdin, "buffer", None)
+    if binary_stream is not None:
+        payload = binary_stream.read(MAX_COMMAND_FILE_BYTES + 1)
+    else:
+        text = sys.stdin.read(MAX_COMMAND_FILE_BYTES + 1)
+        payload = text.encode("utf-8")
+
+    if len(payload) > MAX_COMMAND_FILE_BYTES:
+        raise ValueError(f"YAML input exceeds the {MAX_COMMAND_FILE_BYTES}-byte safety limit.")
+    try:
+        return payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("YAML input is not valid UTF-8.") from exc
+
+
+def cmd_add_yaml(yaml_str: str):
+    if len(yaml_str.encode("utf-8")) > MAX_COMMAND_FILE_BYTES:
+        _error(f"YAML input exceeds the {MAX_COMMAND_FILE_BYTES}-byte safety limit.")
+        sys.exit(1)
+    try:
+        data = _safe_load_yaml_text(yaml_str)
+    except yaml.YAMLError as exc:
+        _error(f"YAML parse error: {exc}")
+        sys.exit(1)
+
+    if not isinstance(data, dict):
+        _error("Input must be a YAML mapping.")
+        sys.exit(1)
+
+    target = _preferred_command_file_for_write()
+    existing_commands = load_cmds(find_yamls())
+    lookup_index, lookup_errors = _build_command_lookup_index(existing_commands)
+    if lookup_errors:
+        for message in lookup_errors:
+            _error(message)
+        sys.exit(1)
+
+    had_errors = False
+    added_count = 0
+
+    for name, cfg in data.items():
+        if not isinstance(cfg, dict):
+            had_errors = True
+            continue
+
+        normalized_name = str(name).strip()
+        if not _is_valid_name(normalized_name):
+            _error(f"skipping '{name}': invalid command name")
+            had_errors = True
+            continue
+
+        validation_error = _validate_command_config(cfg)
+        if validation_error:
+            _error(f"skipping '{name}': {validation_error}")
+            had_errors = True
+            continue
+
+        lookup_key = _command_lookup_key(normalized_name)
+        existing_name = lookup_index.get(lookup_key)
+        if existing_name:
+            _error(
+                f"skipping '{name}': conflicts with existing command '{existing_name}' under case-insensitive lookup"
+            )
+            had_errors = True
+            continue
+
+        saved, sync_messages = save_cmd(normalized_name, cfg, target)
+        if not saved:
+            _report_sync_messages(sync_messages)
+            had_errors = True
+            continue
+
+        has_sync_errors = _report_sync_messages(sync_messages)
+        if has_sync_errors:
+            had_errors = True
+
+        existing_commands[normalized_name] = cfg
+        lookup_index[lookup_key] = normalized_name
+        added_count += 1
+        _ok(f"Added '{normalized_name}' to {target}")
+
+    if added_count == 0:
+        _error("No valid commands were added.")
+        sys.exit(1)
+
+    if had_errors:
+        sys.exit(1)
+
+
+def _pip_install():
+    location = _find_package_source()
+    if not location:
+        _error("cannot locate package source. Run 'python -m pip install .' from the project root.")
+        sys.exit(1)
+    return_code = _run_pip(["install", *_pip_install_scope_args(), location], cwd=location)
+    sys.exit(return_code)
+
+
+def _pip_uninstall():
+    sync_errors = sync_binaries({}, uninstall=True)
+    _report_sync_messages(sync_errors)
+
+    if _run_pip(["show", PRIMARY_WRAPPER], suppress_output=True) != 0:
+        _warn(f"{PRIMARY_WRAPPER} is not installed.")
+        sys.exit(0)
+
+    return_code = _run_pip(["uninstall", PRIMARY_WRAPPER, "-y"])
+    if return_code == 0:
+        _ok(f"Uninstalled {PRIMARY_WRAPPER}.")
+    sys.exit(return_code)
+
+
+def _find_package_source() -> Optional[str]:
+    current = os.path.realpath(__file__)
+    for _ in range(3):
+        current = os.path.dirname(current)
+        if os.path.isfile(os.path.join(current, "pyproject.toml")):
+            return current
+    candidate = os.path.dirname(_SCRIPT_DIR)
+    if os.path.isfile(os.path.join(candidate, "pyproject.toml")):
+        return candidate
+    return None
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fd:
+        for chunk in iter(lambda: fd.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _command_file_snapshot_paths() -> List[str]:
+    snapshot_paths = set(find_yamls())
+    snapshot_roots = {
+        _legacy_config_dir(),
+        _user_config_dir(),
+        os.getcwd(),
+    }
+
+    for root in snapshot_roots:
+        for candidate in _command_file_candidates(root):
+            snapshot_paths.add(candidate)
+
+    return sorted(snapshot_paths)
+
+
+def _command_file_inventory_directories() -> List[str]:
+    cwd = os.getcwd()
+    directories = {
+        _legacy_config_dir(),
+        _user_config_dir(),
+        cwd,
+        os.path.join(cwd, ".commands-wrapper"),
+        os.path.join(cwd, "commands-wrapper"),
+    }
+    return sorted(directories)
+
+
+def _snapshot_yaml_directory_inventory(directories: List[str]) -> Dict[str, List[str]]:
+    inventory: Dict[str, List[str]] = {}
+    for directory in directories:
+        files = _scan_yaml_files(directory)
+        inventory[directory] = sorted(
+            os.path.realpath(path) for path in files if os.path.isfile(path)
+        )
+    return inventory
+
+
+def _detect_new_yaml_inventory_files(
+    snapshot_inventory: Dict[str, List[str]],
+) -> List[str]:
+    created: List[str] = []
+    for directory, before_paths in snapshot_inventory.items():
+        before_set = set(before_paths)
+        current_files = _scan_yaml_files(directory)
+        current_paths = [os.path.realpath(path) for path in current_files if os.path.isfile(path)]
+        for path in current_paths:
+            if path not in before_set:
+                created.append(path)
+
+    created.sort()
+    return list(dict.fromkeys(created))
+
+
+def _snapshot_command_files(files: List[str]) -> Dict[str, Tuple[bool, Optional[str]]]:
+    snapshots: Dict[str, Tuple[bool, Optional[str]]] = {}
+    for path in files:
+        existed = os.path.isfile(path)
+        if not existed:
+            snapshots[path] = (False, None)
+            continue
+        try:
+            snapshots[path] = (True, _read_bounded_utf8_file(path))
+        except (OSError, yaml.YAMLError):
+            snapshots[path] = (True, None)
+    return snapshots
+
+
+def _restore_command_file_snapshots(
+    snapshots: Dict[str, Tuple[bool, Optional[str]]],
+    *,
+    created_files: Optional[List[str]] = None,
+) -> None:
+    for path, (existed, content) in snapshots.items():
+        if not existed or content is None:
+            continue
+
+        parent = os.path.dirname(path)
+        if parent:
+            try:
+                os.makedirs(parent, exist_ok=True)
+            except OSError:
+                continue
+        try:
+            _atomic_write_text(path, content)
+        except OSError:
+            continue
+
+    if created_files:
+        for path in created_files:
+            if not os.path.isfile(path):
+                continue
+            try:
+                os.remove(path)
+            except OSError:
+                continue
+
+
+def _detect_unexpected_command_file_changes(
+    snapshots: Dict[str, Tuple[bool, Optional[str]]],
+) -> Tuple[List[str], List[str]]:
+    changed: List[str] = []
+    created: List[str] = []
+
+    for path, (existed, original) in snapshots.items():
+        exists_now = os.path.isfile(path)
+        if not existed:
+            if exists_now:
+                created.append(path)
+            continue
+
+        if not exists_now:
+            changed.append(path)
+            continue
+
+        if original is None:
+            continue
+
+        try:
+            current = _read_bounded_utf8_file(path)
+        except (OSError, yaml.YAMLError):
+            changed.append(path)
+            continue
+
+        if current != original:
+            changed.append(path)
+    changed.sort()
+    created.sort()
+    return changed, created
+
+
+def _validated_update_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme == "https" and parsed.netloc:
+        return url
+
+    if _env_flag_enabled("COMMANDS_WRAPPER_ALLOW_INSECURE_UPDATE"):
+        if parsed.scheme == "http" and parsed.netloc:
+            return url
+        if parsed.scheme == "file" and parsed.path:
+            return url
+
+    raise ValueError(
+        "update URL must use HTTPS; set COMMANDS_WRAPPER_ALLOW_INSECURE_UPDATE=1 "
+        "only for a trusted local development source"
+    )
+
+
+def _download_update_archive(source_url: str, archive_path: str) -> None:
+    try:
+        with (
+            urllib.request.urlopen(  # nosec B310
+                source_url,
+                timeout=DEFAULT_UPDATE_DOWNLOAD_TIMEOUT,
+            ) as response,
+            open(archive_path, "wb") as out,
+        ):
+            final_url_getter = getattr(response, "geturl", None)
+            if callable(final_url_getter):
+                _validated_update_url(str(final_url_getter()))
+
+            content_length = (
+                response.headers.get("Content-Length") if hasattr(response, "headers") else None
+            )
+            if content_length:
+                try:
+                    declared_size = int(content_length)
+                except ValueError:
+                    declared_size = 0
+                if declared_size > MAX_UPDATE_ARCHIVE_BYTES:
+                    raise ValueError("update archive exceeds the 64 MiB safety limit")
+
+            downloaded = 0
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                downloaded += len(chunk)
+                if downloaded > MAX_UPDATE_ARCHIVE_BYTES:
+                    raise ValueError("update archive exceeds the 64 MiB safety limit")
+                out.write(chunk)
+    except ValueError:
+        raise
+    except (OSError, urllib.error.URLError) as exc:
+        raise ValueError(f"failed to download update archive: {exc}") from exc
+
+
+def _prepare_update_source() -> Tuple[str, Optional[str]]:
+    source = UPDATE_SOURCE
+    expected_sha256 = os.environ.get("COMMANDS_WRAPPER_UPDATE_SHA256", "").strip().lower()
+    if expected_sha256 and (
+        len(expected_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_sha256)
+    ):
+        raise ValueError(
+            "invalid COMMANDS_WRAPPER_UPDATE_SHA256 value (expected 64 lowercase hex characters)"
+        )
+
+    parsed = urllib.parse.urlparse(source)
+    if not parsed.scheme:
+        if source != PRIMARY_WRAPPER:
+            raise ValueError(
+                "non-URL update sources are restricted to the official commands-wrapper package"
+            )
+        if expected_sha256:
+            raise ValueError(
+                "COMMANDS_WRAPPER_UPDATE_SHA256 is only supported with a URL update source"
+            )
+        return source, None
+
+    source_url = _validated_update_url(source)
+    if not expected_sha256:
+        return source_url, None
+
+    fd, archive_path = tempfile.mkstemp(prefix="commands-wrapper-update-", suffix=".tar.gz")
+    os.close(fd)
+
+    try:
+        _download_update_archive(source_url, archive_path)
+    except ValueError:
+        try:
+            os.remove(archive_path)
+        except OSError:
+            pass
+        raise
+
+    actual_sha256 = _sha256_file(archive_path)
+    if actual_sha256 != expected_sha256:
+        try:
+            os.remove(archive_path)
+        except OSError:
+            pass
+        raise ValueError(
+            "update archive checksum mismatch "
+            f"for {source_url}: expected {expected_sha256[:12]}..., got {actual_sha256[:12]}..."
+        )
+
+    return archive_path, archive_path
+
+
+def _find_source_cli_for_build_artifact(script_path: Optional[str] = None) -> Optional[str]:
+    current = os.path.realpath(script_path or __file__)
+    normalized = current.replace("\\", "/")
+    if "/build/scripts-" not in normalized:
+        return None
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(current)))
+    source_cli = os.path.join(repo_root, ".commands-wrapper", PRIMARY_WRAPPER)
+    if not os.path.isfile(source_cli):
+        return None
+
+    source_real = os.path.realpath(source_cli)
+    if source_real == current:
+        return None
+
+    return source_real
+
+
+def _reexec_if_stale_build_script() -> None:
+    source_cli = _find_source_cli_for_build_artifact()
+    if not source_cli:
+        return
+
+    _warn(
+        "detected execution from a build artifact; re-running with project source script "
+        f"'{source_cli}'."
+    )
+    os.execv(sys.executable, [sys.executable, source_cli, *sys.argv[1:]])
+
+
+def _auto_update():
+    print(f"{ANSI_MUTED}Updating commands-wrapper...{ANSI_RESET}")
+    snapshot_paths = _command_file_snapshot_paths()
+    command_file_snapshots = _snapshot_command_files(snapshot_paths)
+    unreadable_snapshots = [
+        path
+        for path, (existed, content) in command_file_snapshots.items()
+        if existed and content is None
+    ]
+    if unreadable_snapshots:
+        preview = ", ".join(unreadable_snapshots[:3])
+        if len(unreadable_snapshots) > 3:
+            preview += f" (+{len(unreadable_snapshots) - 3} more)"
+        _error(f"cannot safely snapshot command files before update: {preview}")
+        sys.exit(1)
+    directory_inventory = _snapshot_yaml_directory_inventory(_command_file_inventory_directories())
+    try:
+        update_source, cleanup_path = _prepare_update_source()
+    except ValueError as exc:
+        _error(str(exc))
+        sys.exit(1)
+
+    return_code = 1
+    try:
+        update_args = [
+            "install",
+            "--upgrade",
+            "--force-reinstall",
+            *_pip_install_scope_args(),
+            update_source,
+        ]
+        return_code = _run_pip(update_args, suppress_output=True)
+        if return_code != 0:
+            _warn("Initial update attempt failed; retrying with diagnostics.")
+            return_code = _run_pip(update_args)
+
+        if return_code == 0:
+            sync_db, sync_load_warnings = _load_commands_for_sync()
+            sync_errors = _sync_messages_with_load_warnings(
+                sync_db,
+                sync_load_warnings,
+                prune_stale=False,
+            )
+            sync_has_errors = _report_sync_messages(sync_errors)
+
+            changed_files, created_files = _detect_unexpected_command_file_changes(
+                command_file_snapshots
+            )
+            created_inventory_files = _detect_new_yaml_inventory_files(directory_inventory)
+            unexpected_created_files = list(
+                dict.fromkeys([*created_files, *created_inventory_files])
+            )
+
+            if changed_files or unexpected_created_files:
+                _restore_command_file_snapshots(
+                    command_file_snapshots,
+                    created_files=unexpected_created_files,
+                )
+                unexpected_files = list(dict.fromkeys([*changed_files, *unexpected_created_files]))
+                changed_preview = ", ".join(unexpected_files[:3])
+                if len(unexpected_files) > 3:
+                    changed_preview += f" (+{len(unexpected_files) - 3} more)"
+                _error(
+                    "update unexpectedly modified command files; restored original content: "
+                    f"{changed_preview}"
+                )
+                return_code = 1
+            elif sync_has_errors:
+                return_code = 1
+            else:
+                _ok("Update complete.")
+        else:
+            _error(f"update failed with exit code {return_code}")
+    finally:
+        if cleanup_path:
+            try:
+                os.remove(cleanup_path)
+            except OSError:
+                pass
+
+    sys.exit(return_code)
+
+
+class _Parser(argparse.ArgumentParser):
+    def exit(self, status=0, message=None):
+        if message:
+            self._print_message(message, sys.stderr)
+        sys.exit(status)
+
+
+def main():
+    _reexec_if_stale_build_script()
+
+    if sys.argv[1:] == ["--install"]:
+        _pip_install()
+
+    if sys.argv[1:] == ["--uninstall"]:
+        _pip_uninstall()
+
+    p = _Parser(description="Wrap multi-step shell sequences into a single named command.")
+    p.add_argument("action", nargs=argparse.REMAINDER)
+    args = p.parse_args()
+
+    action_parts = args.action
+
+    if not action_parts:
+        startup_tip = ""
+        if _consume_first_launch_tip():
+            startup_tip = (
+                f"INFO: Tip: use '{SHORT_ALIAS}' to launch {PRIMARY_WRAPPER} from anywhere."
+            )
+        run_wizard(startup_status=startup_tip)
+        return
+
+    action = action_parts[0]
+    normalized_action = action.casefold()
+    full_action = " ".join(action_parts)
+    wrapper_entry = os.environ.get("COMMANDS_WRAPPER_WRAPPER_ENTRY", "").strip() == "1"
+    wrapper_parent_pid = os.getppid() if wrapper_entry else None
+    is_update_action = normalized_action in ("update", "upd")
+    internal_cd_target_action = (
+        normalized_action == "__cd-target"
+        and os.environ.get("COMMANDS_WRAPPER_INTERNAL", "").strip() == "1"
+    )
+    internal_resolve_action = (
+        normalized_action == "__resolve"
+        and os.environ.get("COMMANDS_WRAPPER_INTERNAL", "").strip() == "1"
+    )
+
+    command_files = find_yamls()
+    promoted_local_commands: List[str] = []
+    if not is_update_action:
+        promoted_local_commands = _promote_local_commands_to_global(command_files)
+        if promoted_local_commands:
+            command_files = find_yamls()
+
+    load_warnings: List[str] = []
+    db = load_cmds(command_files, warnings=load_warnings)
+    if promoted_local_commands:
+        _warn(
+            "Promoted "
+            f"{len(promoted_local_commands)} local command(s) to global config for cross-directory use. "
+            f"Set {AUTO_PROMOTE_LOCAL_COMMANDS_ENV}=1 only when persistent promotion is intended."
+        )
+    for warning in load_warnings:
+        _warn(warning)
+    lookup_index, lookup_errors = _build_command_lookup_index(db)
+    if lookup_errors:
+        for message in lookup_errors:
+            _error(message)
+        sys.exit(1)
+
+    resolved_full_action = _resolve_command_name(full_action, db, lookup_index)
+    resolved_action = _resolve_command_name(action, db, lookup_index)
+
+    def _exec_target_with_wrapper_context(
+        target_name: str,
+        *,
+        allow_single_cd_shell: bool = True,
+    ) -> None:
+        cfg = db[target_name]
+        wrapper_single_cd = (
+            wrapper_entry and len(action_parts) == 1 and _command_uses_single_cd(cfg)
+        )
+        hook_active = _env_flag_enabled(HOOK_ACTIVE_ENV)
+
+        if wrapper_single_cd and not hook_active:
+            _ensure_shell_hook_init()
+
+        if wrapper_entry and not wrapper_single_cd:
+            _apply_wrapper_cwd_context(wrapper_parent_pid)
+
+        effective_allow_single_cd_shell = allow_single_cd_shell and (
+            not wrapper_single_cd or not hook_active
+        )
+        if effective_allow_single_cd_shell:
+            exec_cmd(target_name, cfg)
+        else:
+            exec_cmd(
+                target_name,
+                cfg,
+                allow_single_cd_shell=False,
+            )
+
+        if wrapper_single_cd and wrapper_parent_pid is not None:
+            _remember_wrapper_cwd_context(wrapper_parent_pid, os.getcwd())
+
+    if (
+        normalized_action
+        not in (
+            "sync",
+            "add",
+            "rm",
+            "remove",
+            "configure",
+            "config",
+        )
+        and not internal_cd_target_action
+        and not internal_resolve_action
+        and not is_update_action
+    ):
+        sync_kwargs: Dict[str, Any] = {
+            "report_conflicts": False,
+            "prune_stale": False,
+        }
+        if load_warnings:
+            _warn("Skipping stale wrapper cleanup because command files have warnings.")
+        _report_sync_messages(sync_binaries(db, **sync_kwargs))
+
+    if internal_cd_target_action:
+        command_name = " ".join(action_parts[1:]).strip()
+        if not command_name:
+            _error(f"Usage: {PRIMARY_WRAPPER} __cd-target <command-name>")
+            sys.exit(1)
+
+        try:
+            destination = _single_cd_destination_for_command(command_name, db, lookup_index)
+        except ValueError as exc:
+            _error(str(exc))
+            sys.exit(1)
+
+        if destination:
+            print(destination)
+        return
+
+    if internal_resolve_action:
+        command_name = " ".join(action_parts[1:]).strip()
+        if not command_name:
+            _error(f"Usage: {PRIMARY_WRAPPER} __resolve <command-name>")
+            sys.exit(1)
+
+        resolved_name = _resolve_command_name(command_name, db, lookup_index)
+        if resolved_name:
+            print(resolved_name)
+        return
+
+    if normalized_action == "sync":
+        sync_args = action_parts[1:]
+        if sync_args not in ([], ["--uninstall"]):
+            _error(f"Usage: {PRIMARY_WRAPPER} sync [--uninstall]")
+            sys.exit(1)
+
+        is_uninstall = sync_args == ["--uninstall"]
+        if not is_uninstall:
+            _warn("Manual sync is no longer required. Wrappers are synced automatically.")
+        sync_kwargs = {"uninstall": is_uninstall}
+        if load_warnings and not is_uninstall:
+            sync_kwargs["prune_stale"] = False
+            _warn("Skipping stale wrapper cleanup because command files have warnings.")
+        sync_errors = sync_binaries(db, **sync_kwargs)
+        if _report_sync_messages(sync_errors):
+            sys.exit(1)
+        if not is_uninstall:
+            _ok("Automatic wrapper sync complete.")
+        return
+
+    if resolved_full_action:
+        _exec_target_with_wrapper_context(resolved_full_action)
+        return
+
+    if normalized_action in ("-h", "--help"):
+        _expect_no_extra_action_parts(action_parts, f"Usage: {PRIMARY_WRAPPER} --help")
+        p.print_help()
+
+    elif normalized_action in ("update", "upd"):
+        _expect_no_extra_action_parts(action_parts, f"Usage: {PRIMARY_WRAPPER} update")
+        _auto_update()
+
+    elif normalized_action in ("ls", "list"):
+        _expect_no_extra_action_parts(action_parts, f"Usage: {PRIMARY_WRAPPER} list")
+        print_list(db)
+
+    elif normalized_action == "hook":
+        _expect_no_extra_action_parts(action_parts, f"Usage: {PRIMARY_WRAPPER} hook")
+        target_dir = _script_bin_dir(os.name)
+        wrappers, wrapper_errors, _ = _build_wrapper_map_with_conflicts(db, target_dir)
+        fatal_hook_errors = [
+            message for message in wrapper_errors if not message.startswith("WARN: ")
+        ]
+        if fatal_hook_errors:
+            for message in fatal_hook_errors:
+                _error(message)
+            sys.exit(1)
+        if os.name == "nt":
+            print(f"doskey {SHORT_ALIAS}={PRIMARY_WRAPPER} $*")
+            print(f"doskey {LEGACY_ALIAS}={PRIMARY_WRAPPER} $*")
+            for wrapper_name, command_name in sorted(wrappers.items()):
+                print(f"doskey {wrapper_name}={PRIMARY_WRAPPER} {_cmd_quote(command_name)} $*")
+        else:
+            print(f'{SHORT_ALIAS}() {{ command {PRIMARY_WRAPPER} "$@"; }}')
+            print(f"alias {LEGACY_ALIAS}='{PRIMARY_WRAPPER}'")
+            print(f"export {HOOK_ACTIVE_ENV}=1")
+            print("__commands_wrapper_dispatch() {")
+            print('  if [ "$#" -lt 1 ]; then')
+            print("    return 2")
+            print("  fi")
+            print('  __cw_name="$1"')
+            print("  shift")
+            print('  if [ "$#" -gt 0 ]; then')
+            print('    __cw_full_name="$__cw_name $*"')
+            print(
+                f'    __cw_resolved="$(COMMANDS_WRAPPER_INTERNAL=1 command {PRIMARY_WRAPPER} __resolve "$__cw_full_name" 2>/dev/null)" || return $?'
+            )
+            print('    if [ -n "$__cw_resolved" ]; then')
+            print(f'      command {PRIMARY_WRAPPER} "$__cw_name" "$@"')
+            print("      return $?")
+            print("    fi")
+            print("  fi")
+            print(
+                f'  __cw_target="$(COMMANDS_WRAPPER_INTERNAL=1 command {PRIMARY_WRAPPER} __cd-target "$__cw_name" 2>/dev/null)" || return $?'
+            )
+            print('  if [ -n "$__cw_target" ]; then')
+            print('    builtin cd -- "$__cw_target" || return $?')
+            print('    if [ "$#" -gt 0 ] && [ "$1" = "--" ]; then')
+            print("      shift")
+            print("    fi")
+            print('    if [ "$#" -gt 0 ]; then')
+            print('      "$@"')
+            print("      return $?")
+            print("    fi")
+            print("    return 0")
+            print("  fi")
+            print(f'  command {PRIMARY_WRAPPER} "$__cw_name" "$@"')
+            print("}")
+            for wrapper_name, command_name in sorted(wrappers.items()):
+                quoted_command = shlex.quote(command_name)
+                if _is_posix_function_name(wrapper_name):
+                    print(
+                        f'{wrapper_name}() {{ __commands_wrapper_dispatch {quoted_command} "$@"; }}'
+                    )
+                else:
+                    print(f'alias {wrapper_name}="{PRIMARY_WRAPPER} {quoted_command}"')
+
+    elif normalized_action in ("configure", "config"):
+        _expect_no_extra_action_parts(action_parts, f"Usage: {PRIMARY_WRAPPER} configure")
+        run_wizard()
+
+    elif normalized_action == "add":
+        _filtered_argv, has_yaml_flag = _strip_add_yaml_flag([PRIMARY_WRAPPER, *action_parts])
+        if not has_yaml_flag or len(_filtered_argv) != 2:
+            _error(f"Usage: {PRIMARY_WRAPPER} add --yaml <<EOF\\n...\\nEOF")
+            sys.exit(1)
+        try:
+            yaml_content = _read_bounded_yaml_stdin()
+        except ValueError as exc:
+            _error(str(exc))
+            sys.exit(1)
+        if not yaml_content.strip():
+            _error("No YAML content on stdin.")
+            sys.exit(1)
+        cmd_add_yaml(yaml_content)
+
+    elif normalized_action in ("rm", "remove"):
+        if len(action_parts) < 2:
+            _error(f"Usage: {PRIMARY_WRAPPER} {action} <name>")
+            sys.exit(1)
+
+        name = " ".join(action_parts[1:])
+        resolved_name = _resolve_command_name(name, db, lookup_index)
+        if not resolved_name:
+            _error(f"'{name}' not found")
+            sys.exit(1)
+
+        removed, err_message, sync_messages = remove_from_file(
+            resolved_name, db[resolved_name]["_source"]
+        )
+        if not removed:
+            _error(err_message)
+            sys.exit(1)
+
+        _ok(f"Removed '{resolved_name}'.")
+
+        has_sync_errors = _report_sync_messages(sync_messages)
+        if has_sync_errors:
+            _warn(f"Removed '{resolved_name}', but wrapper sync reported errors.")
+            sys.exit(1)
+
+    else:
+        if resolved_action and len(action_parts) > 1:
+            if _command_uses_single_cd(db[resolved_action]):
+                if wrapper_entry and wrapper_parent_pid is not None:
+                    _consume_wrapper_cwd_context(wrapper_parent_pid)
+                exec_cmd(
+                    resolved_action,
+                    db[resolved_action],
+                    allow_single_cd_shell=False,
+                )
+                try:
+                    _run_followup_after_cd(
+                        resolved_action,
+                        action_parts[1:],
+                        db,
+                        lookup_index,
+                    )
+                except ValueError as exc:
+                    _error(str(exc))
+                    sys.exit(1)
+                return
+
+            _error(
+                f"'{full_action}' not found. '{resolved_action}' is a complete command name; "
+                "extra tokens are not ignored."
+            )
+            sys.exit(1)
+
+        target = resolved_full_action or resolved_action
+        if target:
+            _exec_target_with_wrapper_context(target)
+        else:
+            _error(f"'{full_action}' not found")
+            sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,12 @@
+# Exact quality/release toolchain used by CI and release workflows.
+# Including the bootstrap file also makes a direct `pip install -r requirements-ci.txt`
+# upgrade vulnerable virtualenv-bundled packaging tools to the audited versions.
+-r requirements-test.txt
+-r requirements-bootstrap.txt
+build==1.5.0
+coverage==7.15.2
+ruff==0.16.0
+mypy==2.3.0
+bandit==1.9.4
+pip-audit==2.10.1
+twine==7.0.0

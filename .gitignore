@@ -1,0 +1,34 @@
+# Build and distribution directories
+build/
+dist/
+dist-*/
+release-assets/
+*.egg-info/
+
+# Packaging artifacts
+*.whl
+*.tar.gz
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test and tooling cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.json
+coverage.xml
+htmlcov/
+
+# Environments
+.env
+.venv
+env/
+venv/
+
+# Local command definitions
+commands.yaml
+commands.yml

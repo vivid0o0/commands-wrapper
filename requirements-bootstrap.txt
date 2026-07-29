@@ -1,0 +1,4 @@
+# Security-controlled bootstrap toolchain. Install this before any other CI/release dependencies.
+pip==26.1.2
+setuptools==83.0.0
+wheel==0.47.0
