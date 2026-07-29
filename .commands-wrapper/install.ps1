@@ -614,16 +614,19 @@ function Ensure-UserPathContains {
 }
 
 function Invoke-WrapperSyncWithRetry {
-    param([string]$WrapperCommand)
+    param(
+        [string]$WrapperCommand,
+        [string]$ScriptsDir
+    )
 
-    $firstSyncOutput = & $WrapperCommand sync 2>&1
+    $firstSyncOutput = & $WrapperCommand sync --bin-dir $ScriptsDir 2>&1
     $firstExitCode = $LASTEXITCODE
     if ($firstExitCode -eq 0) {
         return
     }
 
     Warn-Step "Initial wrapper sync failed; retrying with diagnostics."
-    $secondSyncOutput = & $WrapperCommand sync 2>&1
+    $secondSyncOutput = & $WrapperCommand sync --bin-dir $ScriptsDir 2>&1
     $secondExitCode = $LASTEXITCODE
     if ($secondExitCode -eq 0) {
         return
@@ -857,7 +860,7 @@ Start-Step "Synchronizing wrapper commands"
 $previousBinDir = $env:COMMANDS_WRAPPER_BIN_DIR
 try {
     $env:COMMANDS_WRAPPER_BIN_DIR = $scriptsDir
-    Invoke-WrapperSyncWithRetry -WrapperCommand $syncCommand
+    Invoke-WrapperSyncWithRetry -WrapperCommand $syncCommand -ScriptsDir $scriptsDir
 } catch {
     Fail-Install $_.Exception.Message
 } finally {

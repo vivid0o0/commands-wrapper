@@ -59,7 +59,44 @@ def _write_executable(path: Path, content: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IEXEC)
 
 
+def _provision_cli_subprocess_dependencies(env: dict[str, str]) -> None:
+    dependency_roots: list[str] = []
+    for module_name in ("yaml", "pexpect", "ptyprocess"):
+        spec = importlib.util.find_spec(module_name)
+        if spec is None:
+            continue
+        if spec.submodule_search_locations:
+            dependency_root = str(
+                Path(next(iter(spec.submodule_search_locations))).resolve().parent
+            )
+        elif spec.origin:
+            dependency_root = str(Path(spec.origin).resolve().parent)
+        else:
+            continue
+        if dependency_root not in dependency_roots:
+            dependency_roots.append(dependency_root)
+
+    existing = env.get("PYTHONPATH", "")
+    if existing:
+        dependency_roots.extend(
+            entry for entry in existing.split(os.pathsep) if entry and entry not in dependency_roots
+        )
+    env["PYTHONPATH"] = os.pathsep.join(dependency_roots)
+
+
 class CommandsWrapperTests(unittest.TestCase):
+    def test_cli_subprocess_dependency_provisioning_preserves_required_imports(self):
+        env = {"PYTHONPATH": "/existing/dependency/root"}
+        _provision_cli_subprocess_dependencies(env)
+
+        entries = env["PYTHONPATH"].split(os.pathsep)
+        yaml_spec = importlib.util.find_spec("yaml")
+        self.assertIsNotNone(yaml_spec)
+        assert yaml_spec is not None and yaml_spec.submodule_search_locations
+        yaml_root = str(Path(next(iter(yaml_spec.submodule_search_locations))).resolve().parent)
+        self.assertIn(yaml_root, entries)
+        self.assertIn("/existing/dependency/root", entries)
+
     def test_menu_uppercase_k_navigates_up(self):
         win = _MenuFakeWindow([ord("K"), ord("\n")])
         with mock.patch.multiple(
@@ -2653,7 +2690,26 @@ class CommandsWrapperTests(unittest.TestCase):
 
         self.assertEqual(exc.exception.code, 1)
         sync_mock.assert_not_called()
-        error_mock.assert_called_once_with(f"Usage: {cw.PRIMARY_WRAPPER} sync [--uninstall]")
+        error_mock.assert_called_once_with(
+            f"Usage: {cw.PRIMARY_WRAPPER} sync [--uninstall] [--bin-dir <path>]"
+        )
+
+    def test_main_sync_uses_explicit_wrapper_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            expected_dir = str(Path(tmp).resolve())
+            with (
+                mock.patch.object(cw, "load_cmds", return_value={}),
+                mock.patch.object(cw, "sync_binaries", return_value=[]) as sync_mock,
+                mock.patch.object(cw, "_report_sync_messages", return_value=False),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    ["commands-wrapper", "sync", "--bin-dir", expected_dir],
+                ),
+            ):
+                cw.main()
+
+        sync_mock.assert_called_once_with({}, uninstall=False, bin_dir=expected_dir)
 
     @unittest.skipIf(os.name == "nt", "requires POSIX shell")
     def test_install_sh_local_source_does_not_require_curl_or_tar(self):
@@ -2830,6 +2886,8 @@ class CommandsWrapperTests(unittest.TestCase):
         self.assertIn("$installTarget = $PrimaryWrapper", content)
         self.assertNotIn("archive/refs/heads/main.tar.gz", content)
         self.assertIn("commands-wrapper.exe", content)
+        self.assertIn("sync --bin-dir $ScriptsDir", content)
+        self.assertIn("-ScriptsDir $scriptsDir", content)
 
     def test_install_sh_uses_sysconfig_scripts_dir_and_no_pre_uninstall(self):
         install_sh = SCRIPT_PATH.parent / "install.sh"
@@ -2843,6 +2901,7 @@ class CommandsWrapperTests(unittest.TestCase):
         self.assertIn('SOURCE_URL="${COMMANDS_WRAPPER_SOURCE_URL:-}"', content)
         self.assertNotIn("archive/refs/heads/main.tar.gz", content)
         self.assertNotIn("run_pip uninstall commands-wrapper -y &>/dev/null || true", content)
+        self.assertIn('sync --bin-dir "$(dirname "$wrapper_path")"', content)
 
     def test_uninstall_sh_reports_failed_pip_uninstall(self):
         uninstall_sh = SCRIPT_PATH.parent / "uninstall.sh"
@@ -3653,6 +3712,7 @@ class CommandsWrapperTests(unittest.TestCase):
             env["PYTHONUSERBASE"] = str(fake_user_base)
             env["COMMANDS_WRAPPER_BIN_DIR"] = str(fake_user_base / "bin")
             env["PATH"] = f"{fake_bin}:{fake_user_base}/bin:/usr/bin:/bin"
+            _provision_cli_subprocess_dependencies(env)
 
             command = (
                 "set -e; "

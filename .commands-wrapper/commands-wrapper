@@ -3214,6 +3214,26 @@ def _expect_no_extra_action_parts(action_parts: List[str], usage: str) -> None:
         sys.exit(1)
 
 
+def _parse_sync_action_args(sync_args: List[str]) -> Tuple[bool, Optional[str]]:
+    uninstall = False
+    bin_dir: Optional[str] = None
+    index = 0
+    while index < len(sync_args):
+        argument = sync_args[index]
+        if argument == "--uninstall" and not uninstall:
+            uninstall = True
+            index += 1
+            continue
+        if argument == "--bin-dir" and bin_dir is None and index + 1 < len(sync_args):
+            candidate = sync_args[index + 1].strip()
+            if candidate:
+                bin_dir = os.path.abspath(os.path.expanduser(candidate))
+                index += 2
+                continue
+        raise ValueError
+    return uninstall, bin_dir
+
+
 def _is_posix_function_name(name: str) -> bool:
     if not name:
         return False
@@ -3876,19 +3896,22 @@ def main():
         return
 
     if normalized_action == "sync":
-        sync_args = action_parts[1:]
-        if sync_args not in ([], ["--uninstall"]):
-            _error(f"Usage: {PRIMARY_WRAPPER} sync [--uninstall]")
+        sync_usage = f"Usage: {PRIMARY_WRAPPER} sync [--uninstall] [--bin-dir <path>]"
+        try:
+            is_uninstall, sync_bin_dir = _parse_sync_action_args(action_parts[1:])
+        except ValueError:
+            _error(sync_usage)
             sys.exit(1)
 
-        is_uninstall = sync_args == ["--uninstall"]
         if not is_uninstall:
             _warn("Manual sync is no longer required. Wrappers are synced automatically.")
-        sync_kwargs = {"uninstall": is_uninstall}
+        explicit_sync_kwargs: Dict[str, Any] = {"uninstall": is_uninstall}
+        if sync_bin_dir is not None:
+            explicit_sync_kwargs["bin_dir"] = sync_bin_dir
         if load_warnings and not is_uninstall:
-            sync_kwargs["prune_stale"] = False
+            explicit_sync_kwargs["prune_stale"] = False
             _warn("Skipping stale wrapper cleanup because command files have warnings.")
-        sync_errors = sync_binaries(db, **sync_kwargs)
+        sync_errors = sync_binaries(db, **explicit_sync_kwargs)
         if _report_sync_messages(sync_errors):
             sys.exit(1)
         if not is_uninstall:
