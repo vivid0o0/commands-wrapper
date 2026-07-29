@@ -148,6 +148,50 @@ function Resolve-WrapperSyncCommand {
     return $null
 }
 
+function Invoke-WrapperCommand {
+    param(
+        [string]$WrapperCommand,
+        [string[]]$WrapperArgs
+    )
+
+    $extension = [System.IO.Path]::GetExtension($WrapperCommand).ToLowerInvariant()
+    if ($extension -in @(".exe", ".cmd", ".bat", ".ps1")) {
+        & $WrapperCommand @WrapperArgs
+        $exitCode = $LASTEXITCODE
+        if ($null -eq $exitCode) {
+            $exitCode = if ($?) { 0 } else { 1 }
+        }
+        if ($exitCode -ne 0) {
+            throw "wrapper command failed with exit code $exitCode"
+        }
+        return
+    }
+
+    Invoke-Python (@($WrapperCommand) + $WrapperArgs)
+}
+
+function Remove-ManagedWrapperFiles {
+    param([string]$ScriptsDir)
+
+    if (-not $ScriptsDir -or -not (Test-Path $ScriptsDir -PathType Container)) {
+        return
+    }
+
+    foreach ($file in Get-ChildItem -LiteralPath $ScriptsDir -File -ErrorAction SilentlyContinue) {
+        if ($file.Extension.ToLowerInvariant() -notin @(".cmd", ".ps1")) {
+            continue
+        }
+        try {
+            $header = Get-Content -LiteralPath $file.FullName -TotalCount 2 -ErrorAction Stop
+            if (($header -join "`n") -match "COMMANDS-WRAPPER-GENERATED") {
+                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+            }
+        } catch {
+            Write-Host "WARN: Unable to remove managed wrapper '$($file.Name)'." -ForegroundColor Yellow
+        }
+    }
+}
+
 function Test-PackageInstalled {
     $candidates = @(
         @{ exe = "py"; args = @("-3"); label = "py -3" },
@@ -265,14 +309,14 @@ $syncCommand = Resolve-WrapperSyncCommand -ScriptsDir $scriptsDir
 
 if ($syncCommand) {
     try {
-        & $syncCommand sync --uninstall | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host $syncWarning -ForegroundColor Yellow
-        }
+        Invoke-WrapperCommand `
+            -WrapperCommand $syncCommand `
+            -WrapperArgs @("sync", "--uninstall", "--bin-dir", $scriptsDir) | Out-Null
     } catch {
         Write-Host $syncWarning -ForegroundColor Yellow
     }
 }
+Remove-ManagedWrapperFiles -ScriptsDir $scriptsDir
 
 $isInstalled = Test-PackageInstalled
 if (-not $isInstalled) {

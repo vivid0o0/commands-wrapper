@@ -3271,13 +3271,16 @@ class CommandsWrapperTests(unittest.TestCase):
         self.assertIn("$pythonExitCode -eq 0", content)
         self.assertIn("param([string[]]$PythonArgs)", content)
         self.assertNotIn("param([string[]]$Args)", content)
-        self.assertIn("$LASTEXITCODE -ne 0", content)
+        self.assertIn("$exitCode -ne 0", content)
         self.assertIn("$syncWarning", content)
         self.assertIn("function Get-PythonScriptsDir", content)
         self.assertIn("function Confirm-Action", content)
         self.assertIn("function Remove-UserPathEntry", content)
         self.assertIn("function Test-PackageInstalled", content)
         self.assertIn("function Resolve-WrapperSyncCommand", content)
+        self.assertIn("function Invoke-WrapperCommand", content)
+        self.assertIn("function Remove-ManagedWrapperFiles", content)
+        self.assertIn('@("sync", "--uninstall", "--bin-dir", $scriptsDir)', content)
         self.assertIn('"pip", "show", "commands-wrapper"', content)
         self.assertIn("COMMANDS_WRAPPER_UNINSTALL_FORCE", content)
         self.assertIn("COMMANDS_WRAPPER_REMOVE_CONFIG", content)
@@ -3441,6 +3444,12 @@ class CommandsWrapperTests(unittest.TestCase):
                 "fi\n"
                 "exit 1\n",
             )
+            managed_cmd = fake_bin / "cw.cmd"
+            managed_ps1 = fake_bin / "commands-wrapper.ps1"
+            user_cmd = fake_bin / "user-owned.cmd"
+            managed_cmd.write_text("@rem COMMANDS-WRAPPER-GENERATED\r\n", encoding="utf-8")
+            managed_ps1.write_text("# COMMANDS-WRAPPER-GENERATED\n", encoding="utf-8")
+            user_cmd.write_text("@echo user-owned\r\n", encoding="utf-8")
 
             env = os.environ.copy()
             env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
@@ -3458,6 +3467,9 @@ class CommandsWrapperTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout)
             self.assertIn("commands-wrapper uninstalled.", result.stdout)
             self.assertNotIn("commands-wrapper is not installed.", result.stdout)
+            self.assertFalse(managed_cmd.exists())
+            self.assertFalse(managed_ps1.exists())
+            self.assertTrue(user_cmd.exists())
 
     @unittest.skipIf(os.name == "nt", "requires POSIX shell")
     def test_single_cd_wrapper_binary_bootstraps_shell_hook_integration(self):
