@@ -516,6 +516,28 @@ function Resolve-WrapperSyncCommand {
     return $null
 }
 
+function Invoke-WrapperCommand {
+    param(
+        [string]$WrapperCommand,
+        [string[]]$WrapperArgs
+    )
+
+    $extension = [System.IO.Path]::GetExtension($WrapperCommand).ToLowerInvariant()
+    if ($extension -in @(".exe", ".cmd", ".bat", ".ps1")) {
+        & $WrapperCommand @WrapperArgs
+        $exitCode = $LASTEXITCODE
+        if ($null -eq $exitCode) {
+            $exitCode = if ($?) { 0 } else { 1 }
+        }
+        if ($exitCode -ne 0) {
+            throw "wrapper command failed with exit code $exitCode"
+        }
+        return
+    }
+
+    Invoke-Python (@($WrapperCommand) + $WrapperArgs)
+}
+
 function Test-CommandsWrapperSourceRoot {
     param([string]$Root)
 
@@ -619,27 +641,26 @@ function Invoke-WrapperSyncWithRetry {
         [string]$ScriptsDir
     )
 
-    $firstSyncOutput = & $WrapperCommand sync --bin-dir $ScriptsDir 2>&1
-    $firstExitCode = $LASTEXITCODE
-    if ($firstExitCode -eq 0) {
+    $syncArgs = @("sync", "--bin-dir", $ScriptsDir)
+    $firstFailure = $null
+    try {
+        Invoke-WrapperCommand -WrapperCommand $WrapperCommand -WrapperArgs $syncArgs
         return
+    } catch {
+        $firstFailure = $_.Exception.Message
     }
 
     Warn-Step "Initial wrapper sync failed; retrying with diagnostics."
-    $secondSyncOutput = & $WrapperCommand sync --bin-dir $ScriptsDir 2>&1
-    $secondExitCode = $LASTEXITCODE
-    if ($secondExitCode -eq 0) {
+    try {
+        Invoke-WrapperCommand -WrapperCommand $WrapperCommand -WrapperArgs $syncArgs
         return
+    } catch {
+        if ($firstFailure) {
+            Write-Host "Sync attempt failed: $firstFailure" -ForegroundColor Red
+        }
+        Write-Host "Retry sync failed: $($_.Exception.Message)" -ForegroundColor Red
     }
 
-    if ($firstSyncOutput) {
-        Write-Host "Sync attempt output:" -ForegroundColor Red
-        $firstSyncOutput | ForEach-Object { Write-Host $_ -ForegroundColor Red }
-    }
-    if ($secondSyncOutput) {
-        Write-Host "Retry sync output:" -ForegroundColor Red
-        $secondSyncOutput | ForEach-Object { Write-Host $_ -ForegroundColor Red }
-    }
     throw "automatic wrapper sync failed after retry"
 }
 
@@ -900,23 +921,22 @@ try {
     $isInteractive = $false
 }
 
-if ($isInteractive -and -not $env:CI) {
-    & $syncCommand
-    if ($LASTEXITCODE -ne 0) {
-        Fail-Install "post-install launch preview failed with exit code $LASTEXITCODE"
+try {
+    if ($isInteractive -and -not $env:CI) {
+        Invoke-WrapperCommand -WrapperCommand $syncCommand -WrapperArgs @()
+    } else {
+        Invoke-WrapperCommand -WrapperCommand $syncCommand -WrapperArgs @("list") | Out-Null
     }
-} else {
-    & $syncCommand list | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Fail-Install "post-install verification failed: 'commands-wrapper list' exited with code $LASTEXITCODE"
-    }
+} catch {
+    Fail-Install "post-install launch verification failed: $($_.Exception.Message)"
 }
 Complete-Step
 
 Start-Step "Final health check"
-& $syncCommand --help | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    Fail-Install "final health check failed: 'commands-wrapper --help' exited with code $LASTEXITCODE"
+try {
+    Invoke-WrapperCommand -WrapperCommand $syncCommand -WrapperArgs @("--help") | Out-Null
+} catch {
+    Fail-Install "final health check failed: $($_.Exception.Message)"
 }
 Complete-Step
 

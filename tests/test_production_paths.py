@@ -1312,6 +1312,8 @@ class StateCliAndPlatformPathTests(unittest.TestCase):
             self.assertFalse(errors)
             self.assertTrue((Path(tmp) / "demo.cmd").is_file())
             self.assertTrue((Path(tmp) / "demo.ps1").is_file())
+            self.assertTrue((Path(tmp) / "commands-wrapper.cmd").is_file())
+            self.assertTrue((Path(tmp) / "commands-wrapper.ps1").is_file())
             self.assertNotIn("Demo.cmd", os.listdir(tmp))
 
         with tempfile.TemporaryDirectory() as tmp:

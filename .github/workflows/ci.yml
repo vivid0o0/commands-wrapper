@@ -158,7 +158,7 @@ jobs:
           Get-ChildItem -Force $scriptsDir | Sort-Object Name | ForEach-Object {
             Write-Host "Installed scripts entry: $($_.Name)"
           }
-          foreach ($name in @("cw.cmd", "cw.ps1", "command-wrapper.cmd", "command-wrapper.ps1")) {
+          foreach ($name in @("commands-wrapper.cmd", "commands-wrapper.ps1", "cw.cmd", "cw.ps1", "command-wrapper.cmd", "command-wrapper.ps1")) {
             if (-not (Test-Path (Join-Path $scriptsDir $name))) {
               throw "required wrapper $name was not generated in $scriptsDir"
             }
@@ -218,7 +218,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           py -3 -m pip show commands-wrapper *> $null
           if ($LASTEXITCODE -eq 0) { throw "commands-wrapper remained installed" }
-          foreach ($name in @("commands-wrapper.exe", "cw.cmd", "cw.ps1", "smoke-command.cmd", "smoke-command.ps1")) {
+          foreach ($name in @("commands-wrapper", "commands-wrapper.exe", "commands-wrapper.cmd", "commands-wrapper.ps1", "cw.cmd", "cw.ps1", "smoke-command.cmd", "smoke-command.ps1")) {
             if (Test-Path (Join-Path $scriptsDir $name)) { throw "$name remained after uninstall" }
           }
 

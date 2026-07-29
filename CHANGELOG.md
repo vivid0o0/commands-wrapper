@@ -24,6 +24,7 @@ All notable changes to commands-wrapper are documented here. The project follows
 - Forced installer wrapper synchronization into the resolved Python scripts directory through an explicit CLI argument.
 - Provisioned isolated integration subprocesses with the exact installed runtime dependency roots.
 - Verified native Windows wrapper discovery plus session and persistent user PATH installation in hosted CI.
+- Added native `commands-wrapper.cmd` and `commands-wrapper.ps1` launchers for Windows installations.
 - Preserved compatibility with the Bash 3.2 version shipped by macOS.
 - Removed cosmetic installer dependencies and reduced installer side effects.
 - Made local-to-global command promotion explicit opt-in instead of an automatic side effect.

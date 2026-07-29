@@ -1988,6 +1988,8 @@ def sync_binaries(
             SHORT_ALIAS: None,
             LEGACY_ALIAS: None,
         }
+        if plat == "nt":
+            wrapper_targets[PRIMARY_WRAPPER] = None
         wrapper_targets.update(custom_wrappers)
 
         expand_uppercase_aliases = _directory_supports_distinct_case_names(target_dir, plat)

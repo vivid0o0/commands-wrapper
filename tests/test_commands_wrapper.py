@@ -2867,7 +2867,7 @@ class CommandsWrapperTests(unittest.TestCase):
 
         self.assertIn("$pyExitCode -eq 0", content)
         self.assertIn("$pythonExitCode -eq 0", content)
-        self.assertIn("$LASTEXITCODE -ne 0", content)
+        self.assertIn("$exitCode -ne 0", content)
         self.assertIn("function Normalize-PathSafe", content)
         self.assertIn("function Get-PythonScriptsDir", content)
         self.assertIn("function Resolve-WrapperSyncCommand", content)
@@ -2886,7 +2886,8 @@ class CommandsWrapperTests(unittest.TestCase):
         self.assertIn("$installTarget = $PrimaryWrapper", content)
         self.assertNotIn("archive/refs/heads/main.tar.gz", content)
         self.assertIn("commands-wrapper.exe", content)
-        self.assertIn("sync --bin-dir $ScriptsDir", content)
+        self.assertIn('$syncArgs = @("sync", "--bin-dir", $ScriptsDir)', content)
+        self.assertIn("function Invoke-WrapperCommand", content)
         self.assertIn("-ScriptsDir $scriptsDir", content)
 
     def test_install_sh_uses_sysconfig_scripts_dir_and_no_pre_uninstall(self):
@@ -3295,6 +3296,9 @@ class CommandsWrapperTests(unittest.TestCase):
                 f"  printf '%s\\n' '{fake_bin}'\n"
                 "  exit 0\n"
                 "fi\n"
+                'case "${1:-}" in\n'
+                '  */commands-wrapper) script="$1"; shift; exec "$script" "$@" ;;\n'
+                "esac\n"
                 "exit 0\n",
             )
             _write_executable(
@@ -3345,7 +3349,7 @@ class CommandsWrapperTests(unittest.TestCase):
 
             _write_executable(
                 fake_bin / "py",
-                '#!/bin/sh\nif [ "$1" = "-3" ]; then shift; fi\nexit 0\n',
+                '#!/bin/sh\nif [ "$1" = "-3" ]; then shift; fi\nexit 7\n',
             )
             _write_executable(
                 fake_bin / "python",
@@ -3354,6 +3358,9 @@ class CommandsWrapperTests(unittest.TestCase):
                 f"  printf '%s\\n' '{fake_bin}'\n"
                 "  exit 0\n"
                 "fi\n"
+                'case "${1:-}" in\n'
+                '  */commands-wrapper) script="$1"; shift; exec "$script" "$@" ;;\n'
+                "esac\n"
                 "exit 0\n",
             )
             _write_executable(
