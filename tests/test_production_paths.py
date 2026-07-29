@@ -1,5 +1,6 @@
 import io
 import os
+import shlex
 import subprocess
 import tempfile
 import threading
@@ -8,6 +9,12 @@ from pathlib import Path
 from unittest import mock
 
 from tests.test_commands_wrapper import cw
+
+
+def _shell_command(*parts: str) -> str:
+    if os.name == "nt":
+        return subprocess.list2cmdline(list(parts))
+    return shlex.join(parts)
 
 
 class _FakeCursesError(Exception):
@@ -580,20 +587,23 @@ class ProcessAndExecutionPathTests(unittest.TestCase):
         terminate_mock.assert_called_once_with()
 
     def test_subprocess_adapter_real_output_input_and_completion(self):
-        with mock.patch.object(cw, "_shell_name", return_value="/bin/sh"):
-            adapter = cw.SubprocessProcessAdapter("printf 'hello\\n'", timeout=5)
-            adapter.interact()
-            self.assertEqual(adapter.returncode(), 0)
-            self.assertEqual(adapter.command_text(), "printf 'hello\\n'")
-            adapter.close()
+        output_command = _shell_command(cw.sys.executable, "-c", "print('hello', flush=True)")
+        adapter = cw.SubprocessProcessAdapter(output_command, timeout=5)
+        adapter.interact()
+        self.assertEqual(adapter.returncode(), 0)
+        self.assertEqual(adapter.command_text(), output_command)
+        adapter.close()
 
-            adapter = cw.SubprocessProcessAdapter(
-                "read value; printf '%s\\n' \"$value\"", timeout=5
-            )
-            adapter.sendline("answer")
-            adapter.interact()
-            self.assertEqual(adapter.returncode(), 0)
-            adapter.close()
+        input_command = _shell_command(
+            cw.sys.executable,
+            "-c",
+            "import sys; print(sys.stdin.readline().strip(), flush=True)",
+        )
+        adapter = cw.SubprocessProcessAdapter(input_command, timeout=5)
+        adapter.sendline("answer")
+        adapter.interact()
+        self.assertEqual(adapter.returncode(), 0)
+        adapter.close()
 
     def test_subprocess_adapter_timeout_send_and_close_error_paths(self):
         class Stream:
@@ -666,6 +676,7 @@ class ProcessAndExecutionPathTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             adapter.send("x")
 
+    @unittest.skipUnless(cw.PEXPECT_AVAILABLE, "pexpect is unavailable")
     def test_pexpect_adapter_close_send_returncode_and_timeout_paths(self):
         class Proc:
             pid = 55
@@ -754,7 +765,7 @@ class ProcessAndExecutionPathTests(unittest.TestCase):
         cw._terminate_process_tree(-1)
         with (
             mock.patch.object(cw.os, "name", "posix"),
-            mock.patch.object(cw.os, "getpgid", return_value=10),
+            mock.patch.object(cw.os, "getpgid", return_value=10, create=True),
             mock.patch.object(cw.os, "kill") as kill_mock,
         ):
             cw._terminate_process_tree(20, force=True)
@@ -762,7 +773,7 @@ class ProcessAndExecutionPathTests(unittest.TestCase):
 
         with (
             mock.patch.object(cw.os, "name", "posix"),
-            mock.patch.object(cw.os, "getpgid", side_effect=ProcessLookupError),
+            mock.patch.object(cw.os, "getpgid", side_effect=ProcessLookupError, create=True),
         ):
             cw._terminate_process_tree(20)
 
@@ -786,18 +797,19 @@ class ProcessAndExecutionPathTests(unittest.TestCase):
             before = os.getcwd()
             try:
                 cw._change_directory(tmp)
-                self.assertEqual(os.getcwd(), tmp)
-                self.assertEqual(os.environ["PWD"], tmp)
-                self.assertEqual(os.environ["OLDPWD"], before)
+                self.assertTrue(os.path.samefile(os.getcwd(), tmp))
+                self.assertTrue(os.path.samefile(os.environ["PWD"], tmp))
+                self.assertTrue(os.path.samefile(os.environ["OLDPWD"], before))
             finally:
                 os.chdir(before)
 
+        missing = str(Path(tempfile.gettempdir()) / "definitely-missing-commands-wrapper")
         with self.assertRaises(ValueError):
-            cw._change_directory("/definitely/missing/commands-wrapper")
+            cw._change_directory(missing)
         with (
-            mock.patch.object(cw, "_resolve_cd_target", return_value="/tmp"),
+            mock.patch.object(cw, "_resolve_cd_target", return_value=tempfile.gettempdir()),
             mock.patch.object(cw.os.path, "isdir", return_value=True),
-            mock.patch.object(cw.os, "getcwd", return_value="/before"),
+            mock.patch.object(cw.os, "getcwd", return_value=tempfile.gettempdir()),
             mock.patch.object(cw.os, "chdir", side_effect=OSError("denied")),
             self.assertRaises(ValueError),
         ):
@@ -808,7 +820,8 @@ class ProcessAndExecutionPathTests(unittest.TestCase):
             mock.patch.object(cw.subprocess, "run") as run_mock,
         ):
             cw._open_interactive_shell()
-        self.assertIn("-i", run_mock.call_args.args[0])
+        expected_args = ["/bin/sh"] if os.name == "nt" else ["/bin/sh", "-i"]
+        self.assertEqual(run_mock.call_args.args[0], expected_args)
 
         with (
             mock.patch.object(cw, "_shell_name", return_value="missing"),
@@ -935,6 +948,22 @@ class ProcessAndExecutionPathTests(unittest.TestCase):
 
 
 class DirectHelperCoverageTests(unittest.TestCase):
+    def test_directory_case_support_is_platform_and_filesystem_aware(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = cw._directory_supports_distinct_case_names(tmp, "posix")
+            probe = Path(tmp) / "CaseProbe"
+            probe.write_text("probe", encoding="utf-8")
+            expected = not (Path(tmp) / "caseprobe").exists()
+            probe.unlink()
+            self.assertEqual(result, expected)
+            self.assertFalse(any("case-probe" in entry for entry in os.listdir(tmp)))
+
+        self.assertFalse(cw._directory_supports_distinct_case_names(tempfile.gettempdir(), "nt"))
+        with mock.patch.object(cw.tempfile, "mkstemp", side_effect=OSError("denied")):
+            self.assertFalse(
+                cw._directory_supports_distinct_case_names(tempfile.gettempdir(), "posix")
+            )
+
     def test_first_launch_marker_path_uses_user_config_directory(self):
         with mock.patch.object(cw, "_user_config_dir", return_value="/config/root"):
             self.assertEqual(
@@ -996,13 +1025,13 @@ class StateCliAndPlatformPathTests(unittest.TestCase):
                         str(context_path),
                     )
                     loaded = cw._load_wrapper_cwd_context(str(context_path))
-                    self.assertEqual(loaded["123"]["cwd"], str(second))
+                    self.assertTrue(os.path.samefile(loaded["123"]["cwd"], second))
 
                     os.chdir(first)
                     cw._apply_wrapper_cwd_context(123)
-                    self.assertEqual(os.getcwd(), str(second))
-                    self.assertEqual(os.environ["OLDPWD"], str(first))
-                    self.assertEqual(os.environ["PWD"], str(second))
+                    self.assertTrue(os.path.samefile(os.getcwd(), second))
+                    self.assertTrue(os.path.samefile(os.environ["OLDPWD"], first))
+                    self.assertTrue(os.path.samefile(os.environ["PWD"], second))
                     self.assertIsNone(cw._peek_wrapper_cwd_context(123))
 
                     cw._save_wrapper_cwd_context(
@@ -1100,13 +1129,19 @@ class StateCliAndPlatformPathTests(unittest.TestCase):
     def test_cd_resolution_and_command_shape_helpers(self):
         with mock.patch.dict(os.environ, {}, clear=True), self.assertRaises(ValueError):
             cw._resolve_cd_target("-")
-        with mock.patch.dict(os.environ, {"OLDPWD": "/tmp"}, clear=False):
-            self.assertEqual(cw._resolve_cd_target("-"), "/tmp")
+        previous = tempfile.gettempdir()
+        with mock.patch.dict(os.environ, {"OLDPWD": previous}, clear=False):
+            self.assertEqual(
+                os.path.realpath(cw._resolve_cd_target("-")), os.path.realpath(previous)
+            )
         with (
             tempfile.TemporaryDirectory() as tmp,
             mock.patch.dict(os.environ, {"CW_TEST_ROOT": tmp}, clear=False),
         ):
-            self.assertEqual(cw._resolve_cd_target("$CW_TEST_ROOT"), tmp)
+            reference = "%CW_TEST_ROOT%" if os.name == "nt" else "$CW_TEST_ROOT"
+            self.assertEqual(
+                os.path.realpath(cw._resolve_cd_target(reference)), os.path.realpath(tmp)
+            )
 
         self.assertIsNone(cw._extract_cd_target(123))
         self.assertIsNone(cw._extract_cd_target("cd 'unterminated"))
@@ -1137,7 +1172,9 @@ class StateCliAndPlatformPathTests(unittest.TestCase):
             script.touch()
             (root / "pyproject.toml").touch()
             with mock.patch.object(cw, "__file__", str(script)):
-                self.assertEqual(cw._find_package_source(), str(root))
+                resolved = cw._find_package_source()
+            self.assertIsNotNone(resolved)
+            self.assertTrue(os.path.samefile(str(resolved), root))
 
         with (
             mock.patch.object(cw, "__file__", "/missing/a/b/commands-wrapper"),
@@ -1273,7 +1310,8 @@ class StateCliAndPlatformPathTests(unittest.TestCase):
             )
             self.assertFalse(errors)
             self.assertTrue((Path(tmp) / "demo.cmd").is_file())
-            self.assertTrue((Path(tmp) / "Demo.ps1").is_file())
+            self.assertTrue((Path(tmp) / "demo.ps1").is_file())
+            self.assertNotIn("Demo.cmd", os.listdir(tmp))
 
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.object(cw.os, "listdir", side_effect=OSError("denied")):

@@ -19,6 +19,9 @@ All notable changes to commands-wrapper are documented here. The project follows
 - Standardized all project and update URLs on `vivid0o0/commands-wrapper`.
 - Made file updates atomic, permission-preserving, symlink-safe, and concurrency-safe.
 - Reconciled generated wrappers immediately after command rename and removal.
+- Made wrapper generation safe on case-insensitive macOS and Windows filesystems.
+- Added hosted Linux, macOS, and native Windows installer lifecycle verification.
+- Preserved compatibility with the Bash 3.2 version shipped by macOS.
 - Removed cosmetic installer dependencies and reduced installer side effects.
 - Made local-to-global command promotion explicit opt-in instead of an automatic side effect.
 - Enforced command timeouts as wall-clock deadlines and terminated the complete child process group.

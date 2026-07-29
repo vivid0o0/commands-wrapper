@@ -170,10 +170,6 @@ def normalize_sdist(archive_path: Path, epoch: int) -> None:
 def _validate_output_dir(root: Path, output_dir: Path) -> None:
     root = root.resolve()
     unresolved_output = output_dir.expanduser().absolute()
-    for component in (unresolved_output, *unresolved_output.parents):
-        if component.is_symlink():
-            raise ValueError("release output directory and its parents must not be symbolic links")
-
     output_dir = unresolved_output.resolve()
     if output_dir == Path(output_dir.anchor):
         raise ValueError("release output directory must not be a filesystem root")
@@ -187,6 +183,16 @@ def _validate_output_dir(root: Path, output_dir: Path) -> None:
             raise ValueError(
                 "release output inside the project must use a dedicated dist directory"
             )
+
+    # Inspect only the caller-controlled tail of the output path. Stopping at
+    # the first existing non-symlink parent permits normal platform layouts
+    # such as macOS' /var -> /private/var while still rejecting an output path
+    # (or immediate parent) explicitly redirected through a symlink.
+    for component in (unresolved_output, *unresolved_output.parents):
+        if component.is_symlink():
+            raise ValueError("release output directory and its parents must not be symbolic links")
+        if component.exists():
+            break
 
 
 def _copy_release_tree(

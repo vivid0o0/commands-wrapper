@@ -1563,14 +1563,22 @@ def _build_wrapper_map_with_conflicts(
     db: Dict[str, Any],
     target_dir: str,
     report_conflicts: bool = True,
+    platform_name: Optional[str] = None,
 ) -> Tuple[Dict[str, str], List[str], Dict[str, str]]:
     wrappers, errors = _build_wrapper_map(db)
     filtered: Dict[str, str] = {}
     blocked: Dict[str, str] = {}
 
     search_path = os.environ.get("PATH")
+    distinct_case_names = _directory_supports_distinct_case_names(target_dir, platform_name)
+    seen_physical_names: set[str] = set()
 
     for wrapper_name, command_name in wrappers.items():
+        physical_name = wrapper_name if distinct_case_names else wrapper_name.casefold()
+        if physical_name in seen_physical_names:
+            continue
+        seen_physical_names.add(physical_name)
+
         resolved = shutil.which(wrapper_name, path=search_path)
 
         if resolved and not _is_own_wrapper_path(resolved, target_dir):
@@ -1582,6 +1590,39 @@ def _build_wrapper_map_with_conflicts(
         filtered[wrapper_name] = command_name
 
     return filtered, errors, blocked
+
+
+def _directory_supports_distinct_case_names(
+    directory: str,
+    platform_name: Optional[str] = None,
+) -> bool:
+    """Return whether *directory* can hold names differing only by case."""
+    if (platform_name or os.name) == "nt":
+        return False
+
+    fd: Optional[int] = None
+    probe_path: Optional[str] = None
+    try:
+        fd, probe_path = tempfile.mkstemp(
+            prefix=".commands-wrapper-case-probe-a-",
+            dir=directory,
+        )
+        os.close(fd)
+        fd = None
+        alternate = os.path.join(directory, os.path.basename(probe_path).swapcase())
+        return not os.path.exists(alternate)
+    except OSError:
+        # Omitting an uppercase convenience alias is safer than overwriting the
+        # canonical wrapper when case sensitivity cannot be established.
+        return False
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if probe_path is not None:
+            try:
+                os.remove(probe_path)
+            except OSError:
+                pass
 
 
 def _atomic_write_text(file_path: str, content: str, *, mode: Optional[int] = None) -> None:
@@ -1907,6 +1948,7 @@ def sync_binaries(
             db,
             target_dir,
             report_conflicts=report_conflicts,
+            platform_name=plat,
         )
         errors.extend(wrapper_errors)
 
@@ -1918,14 +1960,16 @@ def sync_binaries(
         }
         wrapper_targets.update(custom_wrappers)
 
+        expand_uppercase_aliases = _directory_supports_distinct_case_names(target_dir, plat)
         expanded_wrapper_targets: Dict[str, Optional[str]] = {}
         for wrapper_name, command_name in wrapper_targets.items():
             if wrapper_name not in expanded_wrapper_targets:
                 expanded_wrapper_targets[wrapper_name] = command_name
 
-            uppercase_alias = _wrapper_upper_alias(wrapper_name)
-            if uppercase_alias and uppercase_alias not in expanded_wrapper_targets:
-                expanded_wrapper_targets[uppercase_alias] = command_name
+            if expand_uppercase_aliases:
+                uppercase_alias = _wrapper_upper_alias(wrapper_name)
+                if uppercase_alias and uppercase_alias not in expanded_wrapper_targets:
+                    expanded_wrapper_targets[uppercase_alias] = command_name
 
         wrapper_targets = expanded_wrapper_targets
 

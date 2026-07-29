@@ -836,7 +836,20 @@ if (-not $scriptsDir) {
 
 $syncCommand = Resolve-WrapperSyncCommand -ScriptsDir $scriptsDir
 if (-not $syncCommand) {
-    Fail-Install "installed binary was not found in '$scriptsDir'"
+    $existingCommand = Get-Command $PrimaryWrapper -ErrorAction SilentlyContinue
+    if ($existingCommand) {
+        $existingPath = $existingCommand.Source
+        if (-not $existingPath) {
+            $existingPath = $existingCommand.Path
+        }
+        if ($existingPath -and (Test-Path $existingPath)) {
+            $syncCommand = $existingPath
+            $scriptsDir = Split-Path -Parent $existingPath
+        }
+    }
+}
+if (-not $syncCommand) {
+    Fail-Install "installed binary was not found in '$scriptsDir' or on PATH"
 }
 Complete-Step
 

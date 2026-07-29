@@ -756,14 +756,22 @@ step_ok
 
 INSTALLED_VERSION="$(installed_package_version || true)"
 
-PIP_INSTALL_SCOPE_ARGS=()
+PIP_INSTALL_SCOPE_ARG=""
 if ! python3 - <<'PY_SCOPE'
 import sys
 raise SystemExit(0 if getattr(sys, 'base_prefix', sys.prefix) != sys.prefix else 1)
 PY_SCOPE
 then
-    PIP_INSTALL_SCOPE_ARGS=(--user)
+    PIP_INSTALL_SCOPE_ARG="--user"
 fi
+
+install_package_target() {
+    if [ -n "$PIP_INSTALL_SCOPE_ARG" ]; then
+        run_pip install --upgrade "$PIP_INSTALL_SCOPE_ARG" "$@"
+    else
+        run_pip install --upgrade "$@"
+    fi
+}
 
 start_step "Installing/updating package"
 if [ -n "$INSTALLED_VERSION" ] && [ -n "$TARGET_VERSION" ]; then
@@ -773,12 +781,12 @@ if [ -n "$INSTALLED_VERSION" ] && [ -n "$TARGET_VERSION" ]; then
     elif [ "$VERSION_RELATION" = "gt" ]; then
         step_warn "installed version $INSTALLED_VERSION is newer than source $TARGET_VERSION; skipping downgrade."
     else
-        if ! run_pip install --upgrade "${PIP_INSTALL_SCOPE_ARGS[@]}" "$INSTALL_TARGET"; then
+        if ! install_package_target "$INSTALL_TARGET"; then
             die "pip install failed while installing commands-wrapper."
         fi
     fi
 else
-    if ! run_pip install --upgrade "${PIP_INSTALL_SCOPE_ARGS[@]}" "$INSTALL_TARGET"; then
+    if ! install_package_target "$INSTALL_TARGET"; then
         die "pip install failed while installing commands-wrapper."
     fi
 fi

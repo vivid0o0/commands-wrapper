@@ -470,9 +470,14 @@ class CommandsWrapperTests(unittest.TestCase):
             wrapper_content = (target_bin / "oc").read_text(encoding="utf-8")
             self.assertIn("COMMANDS_WRAPPER_WRAPPER_ENTRY=1", wrapper_content)
             self.assertIn("COMMANDS_WRAPPER_WRAPPER_NAME=oc", wrapper_content)
-            wrapper_upper_content = (target_bin / "OC").read_text(encoding="utf-8")
+            wrapper_upper_path = target_bin / "OC"
+            wrapper_upper_content = wrapper_upper_path.read_text(encoding="utf-8")
             self.assertIn("COMMANDS_WRAPPER_WRAPPER_ENTRY=1", wrapper_upper_content)
-            self.assertIn("COMMANDS_WRAPPER_WRAPPER_NAME=OC", wrapper_upper_content)
+            if cw._directory_supports_distinct_case_names(str(target_bin), "posix"):
+                self.assertIn("COMMANDS_WRAPPER_WRAPPER_NAME=OC", wrapper_upper_content)
+            else:
+                self.assertTrue(os.path.samefile(target_bin / "oc", wrapper_upper_path))
+                self.assertIn("COMMANDS_WRAPPER_WRAPPER_NAME=oc", wrapper_upper_content)
 
     def test_sync_binaries_skips_primary_wrapper_name(self):
         db = {
@@ -1325,6 +1330,7 @@ class CommandsWrapperTests(unittest.TestCase):
             env = {
                 "HOME": str(home),
                 "XDG_CONFIG_HOME": str(xdg),
+                "APPDATA": str(xdg),
             }
 
             prev_cwd = os.getcwd()
@@ -1376,6 +1382,7 @@ class CommandsWrapperTests(unittest.TestCase):
             env = {
                 "HOME": str(home),
                 "XDG_CONFIG_HOME": str(xdg),
+                "APPDATA": str(xdg),
             }
 
             prev_cwd = os.getcwd()
@@ -1471,14 +1478,15 @@ class CommandsWrapperTests(unittest.TestCase):
             )
 
     def test_scan_yaml_files_breaks_casefold_ties_deterministically(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            directory = Path(tmp)
-            (directory / "A.yaml").write_text("# upper\n", encoding="utf-8")
-            (directory / "a.yaml").write_text("# lower\n", encoding="utf-8")
+        directory = os.path.join(os.sep, "virtual", "commands")
+        with (
+            mock.patch.object(cw.os.path, "isdir", return_value=True),
+            mock.patch.object(cw.os, "listdir", return_value=["a.yaml", "A.yaml"]),
+            mock.patch.object(cw.os.path, "isfile", return_value=True),
+        ):
+            files = cw._scan_yaml_files(directory)
 
-            files = cw._scan_yaml_files(str(directory))
-
-            self.assertEqual([Path(path).name for path in files], ["A.yaml", "a.yaml"])
+        self.assertEqual([Path(path).name for path in files], ["A.yaml", "a.yaml"])
 
     def test_preferred_command_file_for_write_defaults_to_global_path(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1501,6 +1509,7 @@ class CommandsWrapperTests(unittest.TestCase):
             env = {
                 "HOME": str(home),
                 "XDG_CONFIG_HOME": str(xdg),
+                "APPDATA": str(xdg),
             }
 
             prev_cwd = os.getcwd()
@@ -1511,7 +1520,7 @@ class CommandsWrapperTests(unittest.TestCase):
             finally:
                 os.chdir(prev_cwd)
 
-            self.assertEqual(target, str(global_file))
+            self.assertEqual(os.path.realpath(target), os.path.realpath(global_file))
 
     def test_preferred_command_file_for_write_can_opt_in_to_local_path(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1534,6 +1543,7 @@ class CommandsWrapperTests(unittest.TestCase):
             env = {
                 "HOME": str(home),
                 "XDG_CONFIG_HOME": str(xdg),
+                "APPDATA": str(xdg),
                 "COMMANDS_WRAPPER_PREFER_LOCAL_WRITE": "1",
             }
 
@@ -1545,7 +1555,7 @@ class CommandsWrapperTests(unittest.TestCase):
             finally:
                 os.chdir(prev_cwd)
 
-            self.assertEqual(target, str(local_file))
+            self.assertEqual(os.path.realpath(target), os.path.realpath(local_file))
 
     def test_promote_local_commands_to_global_when_explicitly_enabled(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1574,6 +1584,7 @@ class CommandsWrapperTests(unittest.TestCase):
             env = {
                 "HOME": str(home),
                 "XDG_CONFIG_HOME": str(xdg),
+                "APPDATA": str(xdg),
                 cw.AUTO_PROMOTE_LOCAL_COMMANDS_ENV: "1",
             }
 
@@ -1617,6 +1628,7 @@ class CommandsWrapperTests(unittest.TestCase):
             env = {
                 "HOME": str(home),
                 "XDG_CONFIG_HOME": str(xdg),
+                "APPDATA": str(xdg),
             }
 
             prev_cwd = os.getcwd()
@@ -1632,6 +1644,7 @@ class CommandsWrapperTests(unittest.TestCase):
             self.assertIn("dev:", content)
             self.assertNotIn("bais:", content)
 
+    @unittest.skipIf(os.name == "nt", "shell hook initialization is POSIX-only")
     def test_ensure_shell_hook_init_writes_bashrc_block(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1655,6 +1668,7 @@ class CommandsWrapperTests(unittest.TestCase):
             self.assertIn(cw.HOOK_BLOCK_END, content)
             self.assertIn('eval "$(commands-wrapper hook)"', content)
 
+    @unittest.skipIf(os.name == "nt", "shell hook initialization is POSIX-only")
     def test_ensure_shell_hook_init_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1724,6 +1738,7 @@ class CommandsWrapperTests(unittest.TestCase):
             env = {
                 "HOME": str(home),
                 "XDG_CONFIG_HOME": str(xdg),
+                "APPDATA": str(xdg),
             }
 
             prev_cwd = os.getcwd()
@@ -1783,6 +1798,7 @@ class CommandsWrapperTests(unittest.TestCase):
             env = {
                 "HOME": str(home),
                 "XDG_CONFIG_HOME": str(xdg),
+                "APPDATA": str(xdg),
             }
 
             prev_cwd = os.getcwd()
@@ -1826,6 +1842,7 @@ class CommandsWrapperTests(unittest.TestCase):
             env = {
                 "HOME": str(home),
                 "XDG_CONFIG_HOME": str(xdg),
+                "APPDATA": str(xdg),
             }
 
             prev_cwd = os.getcwd()
@@ -1882,6 +1899,7 @@ class CommandsWrapperTests(unittest.TestCase):
             env = {
                 "HOME": str(home),
                 "XDG_CONFIG_HOME": str(xdg),
+                "APPDATA": str(xdg),
             }
 
             prev_cwd = os.getcwd()
@@ -1923,6 +1941,7 @@ class CommandsWrapperTests(unittest.TestCase):
             env = {
                 "HOME": str(home),
                 "XDG_CONFIG_HOME": str(xdg),
+                "APPDATA": str(xdg),
             }
 
             prev_cwd = os.getcwd()
@@ -1961,6 +1980,7 @@ class CommandsWrapperTests(unittest.TestCase):
             env = {
                 "HOME": str(home),
                 "XDG_CONFIG_HOME": str(xdg),
+                "APPDATA": str(xdg),
             }
             target_file = commands_file
 
@@ -2017,6 +2037,7 @@ class CommandsWrapperTests(unittest.TestCase):
             env = {
                 "HOME": str(home),
                 "XDG_CONFIG_HOME": str(xdg),
+                "APPDATA": str(xdg),
             }
 
             prev_cwd = os.getcwd()
@@ -2059,6 +2080,7 @@ class CommandsWrapperTests(unittest.TestCase):
             env = {
                 "HOME": str(home),
                 "XDG_CONFIG_HOME": str(xdg),
+                "APPDATA": str(xdg),
             }
 
             prev_cwd = os.getcwd()
@@ -2101,6 +2123,7 @@ class CommandsWrapperTests(unittest.TestCase):
             env = {
                 "HOME": str(home),
                 "XDG_CONFIG_HOME": str(xdg),
+                "APPDATA": str(xdg),
             }
 
             prev_cwd = os.getcwd()
@@ -2151,6 +2174,7 @@ class CommandsWrapperTests(unittest.TestCase):
             env = {
                 "HOME": str(home),
                 "XDG_CONFIG_HOME": str(xdg),
+                "APPDATA": str(xdg),
             }
 
             prev_cwd = os.getcwd()
@@ -2197,9 +2221,23 @@ class CommandsWrapperTests(unittest.TestCase):
             env = {
                 "HOME": str(home),
                 "XDG_CONFIG_HOME": str(xdg),
+                "APPDATA": str(xdg),
                 "COMMANDS_WRAPPER_BIN_DIR": str(bin_dir),
                 "PATH": "",
             }
+
+            def generated_paths(name: str) -> list[Path]:
+                names = [name]
+                if os.name != "nt" and cw._directory_supports_distinct_case_names(
+                    str(bin_dir), os.name
+                ):
+                    uppercase = cw._wrapper_upper_alias(name)
+                    if uppercase:
+                        names.append(uppercase)
+                suffixes = (".cmd", ".ps1") if os.name == "nt" else ("",)
+                return [
+                    bin_dir / f"{candidate}{suffix}" for candidate in names for suffix in suffixes
+                ]
 
             previous_cwd = os.getcwd()
             try:
@@ -2211,24 +2249,24 @@ class CommandsWrapperTests(unittest.TestCase):
                         str(commands_file),
                     )
                     self.assertTrue(saved, save_messages)
-                    self.assertTrue((bin_dir / "staleprobe").is_file())
-                    self.assertTrue((bin_dir / "STALEPROBE").is_file())
+                    self.assertTrue(all(path.is_file() for path in generated_paths("staleprobe")))
 
                     renamed, rename_error, rename_messages = cw.rename_in_file(
                         "staleprobe", "freshprobe", str(commands_file)
                     )
                     self.assertTrue(renamed, (rename_error, rename_messages))
-                    self.assertFalse((bin_dir / "staleprobe").exists())
-                    self.assertFalse((bin_dir / "STALEPROBE").exists())
-                    self.assertTrue((bin_dir / "freshprobe").is_file())
-                    self.assertTrue((bin_dir / "FRESHPROBE").is_file())
+                    self.assertTrue(
+                        all(not path.exists() for path in generated_paths("staleprobe"))
+                    )
+                    self.assertTrue(all(path.is_file() for path in generated_paths("freshprobe")))
 
                     removed, remove_error, remove_messages = cw.remove_from_file(
                         "freshprobe", str(commands_file)
                     )
                     self.assertTrue(removed, (remove_error, remove_messages))
-                    self.assertFalse((bin_dir / "freshprobe").exists())
-                    self.assertFalse((bin_dir / "FRESHPROBE").exists())
+                    self.assertTrue(
+                        all(not path.exists() for path in generated_paths("freshprobe"))
+                    )
             finally:
                 os.chdir(previous_cwd)
 
@@ -2336,7 +2374,7 @@ class CommandsWrapperTests(unittest.TestCase):
             cw.main()
 
         sync_mock.assert_not_called()
-        print_mock.assert_called_once_with("/tmp")
+        print_mock.assert_called_once_with(cw._resolve_cd_target("/tmp"))
 
     def test_main_internal_cd_target_is_silent_for_non_cd_command(self):
         db = {
@@ -2800,14 +2838,13 @@ class CommandsWrapperTests(unittest.TestCase):
         readme = Path(__file__).resolve().parents[1] / "README.md"
         content = readme.read_text(encoding="utf-8")
 
-        self.assertIn(
-            "curl -fsSL -o install.sh https://github.com/vivid0o0/commands-wrapper/releases/latest/download/install.sh && bash install.sh",
-            content,
+        self.assertEqual(
+            content.count("git clone --depth 1 https://github.com/vivid0o0/commands-wrapper.git"),
+            2,
         )
-        self.assertIn(
-            "irm https://github.com/vivid0o0/commands-wrapper/releases/latest/download/install.ps1 | iex",
-            content,
-        )
+        self.assertIn("bash commands-wrapper/.commands-wrapper/install.sh", content)
+        self.assertIn(r"& .\commands-wrapper\.commands-wrapper\install.ps1", content)
+        self.assertNotIn("releases/latest/download", content)
         self.assertNotIn("omnious0o0", content)
 
     def test_auto_update_retries_with_diagnostics_after_initial_failure(self):
@@ -3154,6 +3191,7 @@ class CommandsWrapperTests(unittest.TestCase):
         self.assertIn("commands-wrapper.exe", content)
         self.assertNotIn("commands-wrapper sync --uninstall", content)
 
+    @unittest.skipIf(os.name == "nt", "uses POSIX command shims under PowerShell")
     @unittest.skipIf(shutil.which("pwsh") is None, "pwsh is not available")
     def test_install_ps1_falls_back_from_py_to_python(self):
         install_ps1 = SCRIPT_PATH.parent / "install.ps1"
@@ -3212,6 +3250,7 @@ class CommandsWrapperTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout)
             self.assertIn("commands-wrapper is installed and self-healed.", result.stdout)
 
+    @unittest.skipIf(os.name == "nt", "uses POSIX command shims under PowerShell")
     @unittest.skipIf(shutil.which("pwsh") is None, "pwsh is not available")
     def test_install_ps1_warns_on_nonzero_sync_exit(self):
         install_ps1 = SCRIPT_PATH.parent / "install.ps1"
@@ -3259,6 +3298,7 @@ class CommandsWrapperTests(unittest.TestCase):
                 result.stdout,
             )
 
+    @unittest.skipIf(os.name == "nt", "uses POSIX command shims under PowerShell")
     @unittest.skipIf(shutil.which("pwsh") is None, "pwsh is not available")
     def test_uninstall_ps1_checks_python_after_py_reports_not_installed(self):
         uninstall_ps1 = SCRIPT_PATH.parent / "uninstall.ps1"
@@ -3871,15 +3911,13 @@ class CommandsWrapperTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.dict(
                 os.environ,
-                {"XDG_CONFIG_HOME": tmp},
+                {"XDG_CONFIG_HOME": tmp, "APPDATA": tmp},
                 clear=False,
             ):
                 path = Path(cw._wrapper_cwd_context_path())
 
-        self.assertEqual(
-            path,
-            Path(tmp) / "commands-wrapper" / ".runtime" / "cwd-context.yaml",
-        )
+        expected = Path(tmp) / "commands-wrapper" / ".runtime" / "cwd-context.yaml"
+        self.assertEqual(os.path.realpath(path), os.path.realpath(expected))
 
     def test_save_cmd_reads_latest_file_state_after_lock_acquisition(self):
         with tempfile.TemporaryDirectory() as tmp:

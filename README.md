@@ -14,13 +14,15 @@ Wraps multi-step shell sequences into a single custom named command. Use it to c
 Unix (Linux/macOS/WSL):
 
 ```bash
-curl -fsSL -o install.sh https://github.com/vivid0o0/commands-wrapper/releases/latest/download/install.sh && bash install.sh
+git clone --depth 1 https://github.com/vivid0o0/commands-wrapper.git
+bash commands-wrapper/.commands-wrapper/install.sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-irm https://github.com/vivid0o0/commands-wrapper/releases/latest/download/install.ps1 | iex
+git clone --depth 1 https://github.com/vivid0o0/commands-wrapper.git
+& .\commands-wrapper\.commands-wrapper\install.ps1
 ```
 
 ## Usage
