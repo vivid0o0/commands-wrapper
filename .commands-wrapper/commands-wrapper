@@ -2767,14 +2767,22 @@ class PExpectProcessAdapter(ProcessAdapter):
         )
         self._log_sink = _PExpectLogSink(sys.stdout)
         self._timed_out = threading.Event()
+        self._timeout_lock = threading.Lock()
 
     def _expire(self) -> None:
         timed_out = getattr(self, "_timed_out", None)
         if timed_out is None:
             timed_out = threading.Event()
             self._timed_out = timed_out
-        timed_out.set()
-        _terminate_process_tree(getattr(self._proc, "pid", None))
+        timeout_lock = getattr(self, "_timeout_lock", None)
+        if timeout_lock is None:
+            timeout_lock = threading.Lock()
+            self._timeout_lock = timeout_lock
+        with timeout_lock:
+            if timed_out.is_set():
+                return
+            timed_out.set()
+            _terminate_process_tree(getattr(self._proc, "pid", None))
 
     def isalive(self) -> bool:
         return self._proc.isalive()
@@ -2792,6 +2800,10 @@ class PExpectProcessAdapter(ProcessAdapter):
 
         try:
             self._proc.interact()
+            if not self._timed_out.is_set():
+                remaining_after_interact = self.remaining_timeout()
+                if remaining_after_interact is not None and remaining_after_interact <= 0:
+                    self._expire()
             if self._timed_out.is_set():
                 raise StepTimeoutError
             return

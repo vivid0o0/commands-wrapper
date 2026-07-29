@@ -1044,12 +1044,16 @@ class CommandsWrapperTests(unittest.TestCase):
         adapter._log_sink = object()
         adapter._timed_out = cw.threading.Event()
 
+        inert_timer = mock.Mock()
         with (
+            mock.patch.object(cw.threading, "Timer", return_value=inert_timer),
             mock.patch.object(cw, "_terminate_process_tree") as terminate_mock,
             self.assertRaises(cw.StepTimeoutError),
         ):
             adapter.interact()
 
+        inert_timer.start.assert_called_once_with()
+        inert_timer.cancel.assert_called_once_with()
         terminate_mock.assert_called_once_with(12345)
 
     @unittest.skipIf(os.name == "nt", "POSIX process groups only")
