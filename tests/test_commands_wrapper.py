@@ -2897,6 +2897,9 @@ class CommandsWrapperTests(unittest.TestCase):
         self.assertIn('(Join-Path $scriptsDir "commands-wrapper.cmd")', content)
         self.assertIn('(Join-Path $scriptsDir "commands-wrapper.ps1")', content)
         self.assertIn("$helpOutput = & $cli --help", content)
+        self.assertIn("$showExitCode = $LASTEXITCODE", content)
+        self.assertIn('Write-Host "Native Windows uninstall cleanup passed"', content)
+        self.assertIn("          exit 0", content)
         self.assertNotIn(
             '(Join-Path $scriptsDir "commands-wrapper")\n          ) | Where-Object',
             content,

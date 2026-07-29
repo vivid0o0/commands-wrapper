@@ -150,7 +150,6 @@ jobs:
           $env:COMMANDS_WRAPPER_DISABLE_FIRST_LAUNCH_TIP = "1"
 
           & ./.commands-wrapper/install.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           $scriptsDir = py -3 -c "import sysconfig; print(sysconfig.get_path('scripts', scheme='nt_user'))"
           if ($LASTEXITCODE -ne 0 -or -not $scriptsDir) { throw "failed to resolve user scripts directory" }
@@ -216,12 +215,27 @@ jobs:
           $env:COMMANDS_WRAPPER_UNINSTALL_FORCE = "1"
           $env:COMMANDS_WRAPPER_REMOVE_CONFIG = "1"
           & ./.commands-wrapper/uninstall.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
           py -3 -m pip show commands-wrapper *> $null
-          if ($LASTEXITCODE -eq 0) { throw "commands-wrapper remained installed" }
+          $showExitCode = $LASTEXITCODE
+          if ($showExitCode -eq 0) { throw "commands-wrapper remained installed" }
+          if ($showExitCode -ne 1) { throw "pip show failed unexpectedly with exit code $showExitCode" }
           foreach ($name in @("commands-wrapper", "commands-wrapper.exe", "commands-wrapper.cmd", "commands-wrapper.ps1", "cw.cmd", "cw.ps1", "smoke-command.cmd", "smoke-command.ps1")) {
             if (Test-Path (Join-Path $scriptsDir $name)) { throw "$name remained after uninstall" }
           }
+
+          $remainingUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+          if ($remainingUserPath -and ($remainingUserPath.Split(";") | Where-Object {
+            $_ -and [string]::Equals(
+              [System.IO.Path]::GetFullPath($_),
+              $normalizedScriptsDir,
+              [System.StringComparison]::OrdinalIgnoreCase
+            )
+          })) {
+            throw "scripts directory remained in the Windows user PATH after uninstall"
+          }
+          Write-Host "Native Windows uninstall cleanup passed"
+          exit 0
 
   quality:
     name: Quality and release checks
