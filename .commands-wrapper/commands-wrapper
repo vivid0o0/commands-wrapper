@@ -1592,6 +1592,36 @@ def _build_wrapper_map_with_conflicts(
     return filtered, errors, blocked
 
 
+def _build_hook_wrapper_map(
+    db: Dict[str, Any],
+    target_dir: str,
+    platform_name: Optional[str] = None,
+) -> Tuple[Dict[str, str], List[str]]:
+    """Build shell aliases while honoring physical executable conflicts."""
+    plat = platform_name or os.name
+    physical_wrappers, errors, _ = _build_wrapper_map_with_conflicts(
+        db,
+        target_dir,
+        platform_name=plat,
+    )
+    if plat == "nt":
+        return physical_wrappers, errors
+
+    logical_wrappers, _ = _build_wrapper_map(db)
+    distinct_case_names = _directory_supports_distinct_case_names(target_dir, plat)
+
+    def physical_key(name: str) -> str:
+        return name if distinct_case_names else name.casefold()
+
+    allowed_keys = {physical_key(name) for name in physical_wrappers}
+    hook_wrappers = {
+        name: command
+        for name, command in logical_wrappers.items()
+        if physical_key(name) in allowed_keys
+    }
+    return hook_wrappers, errors
+
+
 def _directory_supports_distinct_case_names(
     directory: str,
     platform_name: Optional[str] = None,
@@ -2896,7 +2926,7 @@ def _terminate_process_tree(pid: Optional[int], *, force: bool = False) -> None:
     if not pid or pid <= 0:
         return
 
-    sig = signal.SIGKILL if force else signal.SIGTERM
+    sig = getattr(signal, "SIGKILL", signal.SIGTERM) if force else signal.SIGTERM
     if os.name != "nt":
         try:
             process_group = os.getpgid(pid)
@@ -3884,7 +3914,7 @@ def main():
     elif normalized_action == "hook":
         _expect_no_extra_action_parts(action_parts, f"Usage: {PRIMARY_WRAPPER} hook")
         target_dir = _script_bin_dir(os.name)
-        wrappers, wrapper_errors, _ = _build_wrapper_map_with_conflicts(db, target_dir)
+        wrappers, wrapper_errors = _build_hook_wrapper_map(db, target_dir)
         fatal_hook_errors = [
             message for message in wrapper_errors if not message.startswith("WARN: ")
         ]

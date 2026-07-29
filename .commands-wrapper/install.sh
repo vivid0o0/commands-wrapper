@@ -611,13 +611,15 @@ run_sync_with_retry() {
     sync_log_first="$(secure_temp_file 'commands-wrapper-sync-')"
     sync_log_second="$(secure_temp_file 'commands-wrapper-sync-retry-')"
 
-    if "$wrapper_path" sync >"$sync_log_first" 2>&1; then
+    if COMMANDS_WRAPPER_BIN_DIR="$(dirname "$wrapper_path")" \
+        "$wrapper_path" sync >"$sync_log_first" 2>&1; then
         rm -f "$sync_log_first" "$sync_log_second"
         return 0
     fi
 
     step_warn "Initial wrapper sync failed; retrying with diagnostics."
-    if "$wrapper_path" sync >"$sync_log_second" 2>&1; then
+    if COMMANDS_WRAPPER_BIN_DIR="$(dirname "$wrapper_path")" \
+        "$wrapper_path" sync >"$sync_log_second" 2>&1; then
         rm -f "$sync_log_first" "$sync_log_second"
         return 0
     fi

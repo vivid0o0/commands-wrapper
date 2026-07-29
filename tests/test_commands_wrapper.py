@@ -270,20 +270,43 @@ class CommandsWrapperTests(unittest.TestCase):
             target_bin.mkdir(parents=True)
 
             conflict_command = fake_bin / "extract"
-            conflict_command.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-            conflict_command.chmod(0o755)
 
-            with mock.patch.dict(os.environ, {"PATH": str(fake_bin)}, clear=False):
+            with (
+                mock.patch.dict(os.environ, {"PATH": str(fake_bin)}, clear=False),
+                mock.patch.object(
+                    cw.shutil,
+                    "which",
+                    side_effect=lambda name, path=None: (
+                        str(conflict_command) if name.casefold() == "extract" else None
+                    ),
+                ),
+            ):
                 wrappers, messages, blocked = cw._build_wrapper_map_with_conflicts(
                     db,
                     str(target_bin),
                 )
 
         self.assertNotIn("extract", wrappers)
-        self.assertEqual(blocked, {"extract": "extract"})
+        self.assertIn("extract", blocked)
+        self.assertEqual(set(blocked.values()), {"extract"})
         self.assertTrue(messages)
         self.assertIn("already used by another executable on PATH", messages[0])
         self.assertNotIn(str(fake_bin), messages[0])
+
+    def test_hook_map_retains_case_distinct_shell_aliases_on_insensitive_filesystems(self):
+        db = {"oc": {"steps": [{"command": "echo hi"}]}}
+        with (
+            mock.patch.object(
+                cw,
+                "_build_wrapper_map_with_conflicts",
+                return_value=({"oc": "oc"}, [], {}),
+            ),
+            mock.patch.object(cw, "_directory_supports_distinct_case_names", return_value=False),
+        ):
+            wrappers, errors = cw._build_hook_wrapper_map(db, "/virtual/bin", "posix")
+
+        self.assertFalse(errors)
+        self.assertEqual(wrappers, {"oc": "oc", "OC": "oc"})
 
     def test_sync_binaries_can_suppress_conflict_warnings(self):
         db = {
@@ -2433,8 +2456,8 @@ class CommandsWrapperTests(unittest.TestCase):
             mock.patch.object(cw, "_report_sync_messages", return_value=False),
             mock.patch.object(
                 cw,
-                "_build_wrapper_map_with_conflicts",
-                return_value=(wrappers, [], {}),
+                "_build_hook_wrapper_map",
+                return_value=(wrappers, []),
             ),
             mock.patch.object(cw, "print") as print_mock,
             mock.patch.object(sys, "argv", ["commands-wrapper", "hook"]),
@@ -2463,13 +2486,12 @@ class CommandsWrapperTests(unittest.TestCase):
             mock.patch.object(cw, "_report_sync_messages", return_value=False),
             mock.patch.object(
                 cw,
-                "_build_wrapper_map_with_conflicts",
+                "_build_hook_wrapper_map",
                 return_value=(
                     wrappers,
                     [
                         "WARN: skipped naked wrapper 'extract' for command 'extract' because that name is already used by another executable on PATH."
                     ],
-                    {},
                 ),
             ),
             mock.patch.object(cw, "_warn") as warn_mock,

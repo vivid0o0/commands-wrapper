@@ -854,10 +854,18 @@ if (-not $syncCommand) {
 Complete-Step
 
 Start-Step "Synchronizing wrapper commands"
+$previousBinDir = $env:COMMANDS_WRAPPER_BIN_DIR
 try {
+    $env:COMMANDS_WRAPPER_BIN_DIR = $scriptsDir
     Invoke-WrapperSyncWithRetry -WrapperCommand $syncCommand
 } catch {
     Fail-Install $_.Exception.Message
+} finally {
+    if ($null -eq $previousBinDir) {
+        Remove-Item Env:COMMANDS_WRAPPER_BIN_DIR -ErrorAction SilentlyContinue
+    } else {
+        $env:COMMANDS_WRAPPER_BIN_DIR = $previousBinDir
+    }
 }
 
 $cwCandidates = @(

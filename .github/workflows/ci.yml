@@ -99,7 +99,11 @@ jobs:
               - command: "python -c \"print('installer-smoke')\""
           YAML
           test -x "$scripts_dir/smoke-command"
-          "$scripts_dir/smoke-command" | grep -q installer-smoke
+          smoke_output="$("$scripts_dir/smoke-command")"
+          case "$smoke_output" in
+            *installer-smoke*) ;;
+            *) echo "generated wrapper returned unexpected output: $smoke_output" >&2; exit 1 ;;
+          esac
 
           COMMANDS_WRAPPER_UNINSTALL_FORCE=1 COMMANDS_WRAPPER_REMOVE_CONFIG=1 \
             bash .commands-wrapper/uninstall.sh

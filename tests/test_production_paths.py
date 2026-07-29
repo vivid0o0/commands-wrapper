@@ -769,7 +769,8 @@ class ProcessAndExecutionPathTests(unittest.TestCase):
             mock.patch.object(cw.os, "kill") as kill_mock,
         ):
             cw._terminate_process_tree(20, force=True)
-        kill_mock.assert_called_once_with(20, cw.signal.SIGKILL)
+        expected_force_signal = getattr(cw.signal, "SIGKILL", cw.signal.SIGTERM)
+        kill_mock.assert_called_once_with(20, expected_force_signal)
 
         with (
             mock.patch.object(cw.os, "name", "posix"),

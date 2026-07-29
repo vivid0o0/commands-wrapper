@@ -21,6 +21,7 @@ All notable changes to commands-wrapper are documented here. The project follows
 - Reconciled generated wrappers immediately after command rename and removal.
 - Made wrapper generation safe on case-insensitive macOS and Windows filesystems.
 - Added hosted Linux, macOS, and native Windows installer lifecycle verification.
+- Forced installer wrapper synchronization into the resolved Python scripts directory.
 - Preserved compatibility with the Bash 3.2 version shipped by macOS.
 - Removed cosmetic installer dependencies and reduced installer side effects.
 - Made local-to-global command promotion explicit opt-in instead of an automatic side effect.
