@@ -2890,6 +2890,18 @@ class CommandsWrapperTests(unittest.TestCase):
         self.assertIn("function Invoke-WrapperCommand", content)
         self.assertIn("-ScriptsDir $scriptsDir", content)
 
+    def test_ci_windows_installer_executes_native_primary_launcher(self):
+        workflow = SCRIPT_PATH.parents[1] / ".github" / "workflows" / "ci.yml"
+        content = workflow.read_text(encoding="utf-8")
+
+        self.assertIn('(Join-Path $scriptsDir "commands-wrapper.cmd")', content)
+        self.assertIn('(Join-Path $scriptsDir "commands-wrapper.ps1")', content)
+        self.assertIn("$helpOutput = & $cli --help", content)
+        self.assertNotIn(
+            '(Join-Path $scriptsDir "commands-wrapper")\n          ) | Where-Object',
+            content,
+        )
+
     def test_install_sh_uses_sysconfig_scripts_dir_and_no_pre_uninstall(self):
         install_sh = SCRIPT_PATH.parent / "install.sh"
         content = install_sh.read_text(encoding="utf-8")

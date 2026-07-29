@@ -190,12 +190,13 @@ jobs:
           Write-Host "Native Windows PATH verification passed for $normalizedScriptsDir"
 
           $cli = @(
-            (Join-Path $scriptsDir "commands-wrapper.exe"),
-            (Join-Path $scriptsDir "commands-wrapper")
+            (Join-Path $scriptsDir "commands-wrapper.cmd"),
+            (Join-Path $scriptsDir "commands-wrapper.ps1"),
+            (Join-Path $scriptsDir "commands-wrapper.exe")
           ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $cli) { throw "installed command was not found in $scriptsDir" }
-          & $cli --help | Out-Null
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not $cli) { throw "native installed command was not found in $scriptsDir" }
+          $helpOutput = & $cli --help
+          if ($LASTEXITCODE -ne 0 -or -not $helpOutput) { throw "native command help check failed" }
 
           $yaml = @'
           smoke-command:
