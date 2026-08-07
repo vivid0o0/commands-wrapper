@@ -2799,7 +2799,13 @@ class CommandsWrapperTests(unittest.TestCase):
             env["HOME"] = str(fake_home)
 
             result = subprocess.run(
-                ["/bin/bash", str(install_script)],
+                [
+                    "/bin/bash",
+                    "-c",
+                    'umask 022; exec /bin/bash "$1"',
+                    "commands-wrapper-installer-test",
+                    str(install_script),
+                ],
                 cwd=str(work),
                 env=env,
                 stdout=subprocess.PIPE,
@@ -2811,6 +2817,9 @@ class CommandsWrapperTests(unittest.TestCase):
             self.assertNotIn("curl not found", result.stdout)
             self.assertNotIn("tar not found", result.stdout)
             self.assertIn("commands-wrapper is installed and self-healed.", result.stdout)
+            command_file = fake_home / ".config" / "commands-wrapper" / "commands.yaml"
+            self.assertTrue(command_file.is_file())
+            self.assertEqual(stat.S_IMODE(command_file.stat().st_mode), 0o600)
 
     @unittest.skipIf(os.name == "nt", "requires POSIX shell")
     def test_install_sh_remote_source_requires_mktemp(self):

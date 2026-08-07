@@ -843,15 +843,18 @@ if [ -z "$USER_CONFIG_DIR" ]; then
 fi
 mkdir -p "$USER_CONFIG_DIR"
 if [ ! -f "$USER_CONFIG_DIR/commands.yaml" ] && [ ! -f "$USER_CONFIG_DIR/commands.yml" ]; then
-    printf '%s\n' \
-        '# command-name:' \
-        '#   description: "What this command does"' \
-        '#   steps 60:' \
-        '#     - command: "shell command here"' \
-        '#     - send: "text to type into process"' \
-        '#     - press_key: "enter"' \
-        '#     - wait: "2"' \
-        > "$USER_CONFIG_DIR/commands.yaml"
+    (
+        umask 077
+        printf '%s\n' \
+            '# command-name:' \
+            '#   description: "What this command does"' \
+            '#   steps 60:' \
+            '#     - command: "shell command here"' \
+            '#     - send: "text to type into process"' \
+            '#     - press_key: "enter"' \
+            '#     - wait: "2"' \
+            > "$USER_CONFIG_DIR/commands.yaml"
+    )
 fi
 step_ok
 
