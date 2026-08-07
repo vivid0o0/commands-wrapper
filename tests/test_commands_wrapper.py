@@ -2799,7 +2799,13 @@ class CommandsWrapperTests(unittest.TestCase):
             env["HOME"] = str(fake_home)
 
             result = subprocess.run(
-                ["/bin/bash", str(install_script)],
+                [
+                    "/bin/bash",
+                    "-c",
+                    'umask 022; exec /bin/bash "$1"',
+                    "commands-wrapper-installer-test",
+                    str(install_script),
+                ],
                 cwd=str(work),
                 env=env,
                 stdout=subprocess.PIPE,
